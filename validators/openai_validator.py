@@ -1107,6 +1107,104 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 # SEQUENCE DIAGRAM RULE CHECKS — FIXED with proper validation
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# SEQUENCE-ONLY helpers below. These are new, standalone, and only ever
+# called from _rule_check_sequence — they do not touch or get called by
+# _rule_check_usecase / _rule_check_class.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SEQ_STOPWORDS = {
+    "the", "a", "an", "and", "or", "to", "from", "is", "in", "on", "of",
+    "with", "that", "this", "for", "at", "by", "as", "it", "be", "are",
+}
+_SEQ_COMPOUND_CONNECTORS = {"and", "&", "or", "then"}
+
+
+def _seq_levenshtein(a: str, b: str) -> int:
+    """Plain edit-distance DP — used only for sequence-diagram spelling checks."""
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    prev = list(range(lb + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * lb
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (0 if ca == cb else 1))
+        prev = cur
+    return prev[lb]
+
+
+def _seq_closest_scenario_word(name: str, scenario: str) -> Optional[tuple]:
+    """
+    Return (closest_scenario_word, edit_distance) for a lifeline/actor/object
+    name against the words used in the scenario text, or None if nothing
+    close enough is found. Restricted to words of length >= 4 on both sides
+    to avoid noisy false positives on short words.
+    """
+    n = _n(name)
+    if not n or len(n) < 4 or not scenario:
+        return None
+    words = {w for w in re.findall(r"[a-zA-Z]+", scenario.lower()) if w not in _SEQ_STOPWORDS}
+    best_w, best_d = None, None
+    for w in words:
+        if len(w) < 4 or abs(len(w) - len(n)) > 2:
+            continue
+        d = _seq_levenshtein(n, w)
+        if best_d is None or d < best_d:
+            best_d, best_w = d, w
+    if best_w is None:
+        return None
+    return best_w, best_d
+
+
+def _seq_extend_phrase(scen_words: List[str], start_idx: int, n: int, extra: int = 2) -> str:
+    j = start_idx + n
+    tail = scen_words[j:j + extra]
+    return " ".join(scen_words[start_idx:start_idx + n] + tail).strip()
+
+
+def _seq_label_seems_truncated(label: str, scenario: str) -> Optional[str]:
+    """
+    Detect a message-arrow label that looks like a truncated/incomplete
+    version of a longer phrase in the scenario — either a mid-word cut
+    ('request with' vs scenario 'request withdrawal') or dropped trailing
+    words after a compound connector ('insert card' vs scenario
+    'insert card and pin'). Returns the fuller scenario phrase, or None.
+    Conservative by design: only flags clear, mechanically-detectable cases.
+    """
+    lab_words = re.findall(r"[a-zA-Z']+", (label or "").lower())
+    if not lab_words or not scenario:
+        return None
+    scen_words = re.findall(r"[a-zA-Z']+", scenario.lower())
+    n = len(lab_words)
+    if n == 0 or len(scen_words) < n:
+        return None
+
+    for i in range(len(scen_words) - n + 1):
+        window = scen_words[i:i + n]
+
+        # Case A — mid-word truncation: every word matches except the last,
+        # and the diagram's last word is a strict, meaningfully-shorter
+        # prefix of the scenario's word in that same slot.
+        if window[:-1] == lab_words[:-1]:
+            last_lab, last_scen = lab_words[-1], window[-1]
+            if last_scen != last_lab and last_scen.startswith(last_lab) and len(last_scen) - len(last_lab) >= 2:
+                return _seq_extend_phrase(scen_words, i, n, extra=0)
+
+        # Case B — dropped trailing words: label matches exactly, but the
+        # scenario immediately continues with a compound connector,
+        # implying part of the phrase was left off the arrow label.
+        if window == lab_words:
+            j = i + n
+            if j < len(scen_words) and scen_words[j] in _SEQ_COMPOUND_CONNECTORS:
+                return _seq_extend_phrase(scen_words, i, n, extra=2)
+
+    return None
+
 
 def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for sequence diagrams."""
@@ -1149,6 +1247,31 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         else:
             lifelines[n] = name
 
+    # ── Spelling mistake check: lifeline/actor/object name vs scenario wording ──
+    # Deterministic net so a typo'd participant name (e.g. 'custmer' when the
+    # scenario says 'customer') is always caught, instead of relying on the
+    # LLM to notice it every run.
+    if scenario:
+        for s in shapes:
+            if s.get("type") not in ("lifeline", "object_lifeline", "actor"):
+                continue
+            name = _shape_name(s)
+            if not name:
+                continue
+            match = _seq_closest_scenario_word(name, scenario)
+            if not match:
+                continue
+            close_word, dist = match
+            if 0 < dist <= 2 and close_word != _n(name):
+                errors.append({
+                    "error_type": "SPELLING_MISTAKE",
+                    "severity": "WARNING",
+                    "element": name,
+                    "description": f"Lifeline name '{name}' looks like a misspelling of '{close_word}' used in the scenario.",
+                    "suggestion": f"Rename '{name}' to '{close_word.capitalize()}' to match the scenario spelling.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": close_word.capitalize()},
+                })
+
     # ── Check for unlabelled arrows ──
     arrow_count = 0
     for s in shapes:
@@ -1164,6 +1287,24 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                     "suggestion": "Add a message name to this arrow.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
                 })
+            elif scenario:
+                # ── Incomplete/truncated message label check ──
+                # Catches labels cut short on the diagram, e.g. 'request with'
+                # when the scenario says 'request withdrawal', or 'insert
+                # card' when the scenario says 'insert card and pin'.
+                fuller = _seq_label_seems_truncated(label, scenario)
+                if fuller and _n(fuller) != _n(label):
+                    frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
+                    to  = str(s.get("to", "") or s.get("endLifeline", "") or "")
+                    errors.append({
+                        "error_type": "INCOMPLETE_MESSAGE_LABEL",
+                        "severity": "WARNING",
+                        "element": label,
+                        "description": f"Message label '{label}' looks incomplete/truncated. The scenario describes it as '{fuller}'.",
+                        "suggestion": f"Update the arrow label to '{fuller}' to match the scenario.",
+                        "auto_fix": {"fixable": True, "action": "rename_shape",
+                                     "name": fuller, "from_element": frm, "to_element": to},
+                    })
 
     # ── FIX 1: Check return arrow types (WRONG_ARROW_TYPE) ──
     for s in shapes:
@@ -1220,42 +1361,81 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             })
 
     # ── FIX 3: Check for deletion symbols ──
+    # Build lifeline x-centers so a deletion marker can be matched to the
+    # lifeline it visually sits under, in ADDITION to its name/ref field.
+    # A marker's 'lifeline'/'on'/'name' ref is not always reliable (e.g. it
+    # can be blank or point at the wrong id), which previously caused a
+    # marker that IS present on the diagram to be reported as missing on
+    # the wrong lifeline, while a lifeline truly missing its marker was
+    # never checked at all. Geometry is used as the primary signal when
+    # available, since a deletion marker's on-screen position under a
+    # lifeline is unambiguous; the name ref is kept as a fallback.
+    lifeline_x: Dict[str, float] = {}
+    for s in shapes:
+        if s.get("type") in ("lifeline", "object_lifeline", "actor"):
+            ln = _n(_shape_name(s))
+            pos = _geo_pos(s)
+            if ln and pos is not None:
+                w, _h = _geo_size(s)
+                lifeline_x[ln] = pos[0] + w / 2.0
+
+    def _seq_nearest_lifeline_by_x(x: float) -> Optional[str]:
+        if not lifeline_x:
+            return None
+        best_n, best_d = None, None
+        for ln, lx in lifeline_x.items():
+            d = abs(lx - x)
+            if best_d is None or d < best_d:
+                best_d, best_n = d, ln
+        return best_n if best_d is not None and best_d <= 120 else None
+
     # Collect lifelines that have deletion markers
     deletions = set()
     for s in shapes:
         if s.get("type") in ("deletion_marker", "deletion", "destroy", "x", "cross"):
-            ref = str(s.get("lifeline", "") or s.get("on", "") or s.get("name", "") or "")
-            if ref:
-                deletions.add(_n(ref))
-    
-    # Check for missing deletions (only for lifelines that appear to end)
-    # We check if a lifeline has any outgoing messages (suggests it's active and might need deletion)
-    active_lifelines = set()
+            matched = None
+            pos = _geo_pos(s)
+            if pos is not None:
+                w, _h = _geo_size(s)
+                matched = _seq_nearest_lifeline_by_x(pos[0] + w / 2.0)
+            if not matched:
+                ref = str(s.get("lifeline", "") or s.get("on", "") or s.get("name", "") or "")
+                if ref:
+                    matched = _n(ref)
+            if matched:
+                deletions.add(matched)
+
+    # Check for missing deletions. A lifeline is a candidate to "end" (and
+    # therefore likely needs a deletion marker) if it participates in the
+    # interaction at all — either sending OR receiving messages. Previously
+    # only OUTGOING messages counted, which meant a lifeline that mostly
+    # RECEIVES (e.g. a system that sends only one reply back) never reached
+    # the threshold and was skipped entirely, even though it visibly had no
+    # marker on the diagram.
+    msg_total: Dict[str, int] = {}
     for s in shapes:
-        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
-            frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
+        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow",
+                              "self_message_arrow", "self_message_dotted_arrow"):
+            frm = _n(str(s.get("from", "") or s.get("startLifeline", "") or ""))
+            to  = _n(str(s.get("to", "") or s.get("endLifeline", "") or ""))
             if frm:
-                active_lifelines.add(_n(frm))
-    
-    for lifeline in active_lifelines:
-        if lifeline in lifelines and lifeline not in deletions:
-            # Only warn if there are multiple messages (suggests lifeline ends)
-            msg_count = 0
-            for s in shapes:
-                if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
-                    frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
-                    if _n(frm) == lifeline:
-                        msg_count += 1
-            if msg_count >= 2:  # If lifeline sends multiple messages, it likely ends
-                errors.append({
-                    "error_type": "MISSING_DELETION_SYMBOL",
-                    "severity": "WARNING",
-                    "element": lifelines.get(lifeline, lifeline),
-                    "description": f"Lifeline '{lifelines.get(lifeline, lifeline)}' may need a deletion marker (X) at its end.",
-                    "suggestion": f"Add a deletion marker (X) at the bottom of lifeline '{lifelines.get(lifeline, lifeline)}'.",
-                    "auto_fix": {"fixable": True, "action": "add_shape", 
-                                 "shape_type": "deletion_marker", "name": lifeline},
-                })
+                msg_total[frm] = msg_total.get(frm, 0) + 1
+            if to:
+                msg_total[to] = msg_total.get(to, 0) + 1
+
+    for lifeline in lifelines:
+        if lifeline in deletions:
+            continue
+        if msg_total.get(lifeline, 0) >= 2:  # participates enough to likely "end"
+            errors.append({
+                "error_type": "MISSING_DELETION_SYMBOL",
+                "severity": "WARNING",
+                "element": lifelines.get(lifeline, lifeline),
+                "description": f"Lifeline '{lifelines.get(lifeline, lifeline)}' may need a deletion marker (X) at its end.",
+                "suggestion": f"Add a deletion marker (X) at the bottom of lifeline '{lifelines.get(lifeline, lifeline)}'.",
+                "auto_fix": {"fixable": True, "action": "add_shape", 
+                             "shape_type": "deletion_marker", "name": lifeline},
+            })
 
     # ── FIX 4: Check for alt fragments (now actually implemented) ──────────────
     # Previously this was a no-op comment while "missing_alt_fragment" was
@@ -1271,7 +1451,77 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         # slipped through _clean_type unmapped (e.g. custom ToolType names).
         return "fragment" in t or t in ("alt", "opt", "loop", "par", "frame")
 
-    has_fragment = any(_is_fragment_shape(s) for s in shapes)
+    fragment_shapes = [s for s in shapes if _is_fragment_shape(s)]
+    has_fragment = bool(fragment_shapes)
+
+    # ── FIX 5: Missing message inside an alt/opt operand ──────────────────────
+    # Catches the case where an operand's guard condition (e.g.
+    # '[sufficient balance]') is drawn but the message arrow that belongs
+    # inside it was left out (e.g. the 'cash dispensed' return arrow),
+    # leaving that operand visually empty. Purely geometric — only runs
+    # when position/size data is present, so it never guesses when there's
+    # no reliable layout to check against.
+    _guard_re = re.compile(r"^\s*\[(.+?)\]\s*$")
+    for frag in fragment_shapes:
+        fbbox = _geo_bbox(frag)
+        if fbbox is None:
+            continue
+        fx1, fy1, fx2, fy2 = fbbox
+
+        guards = []
+        for s in shapes:
+            if s is frag:
+                continue
+            m = _guard_re.match(_shape_name(s))
+            if not m:
+                continue
+            pos = _geo_pos(s)
+            if pos is None or not (fy1 - 20 <= pos[1] <= fy2 + 20):
+                continue
+            guards.append((pos[1], m.group(1).strip()))
+        if len(guards) < 2:
+            continue  # need at least 2 operands to reason about which is empty
+        guards.sort(key=lambda g: g[0])
+
+        msgs = []
+        for s in shapes:
+            if s.get("type") not in ("arrow", "dashed_arrow", "dotted_arrow",
+                                      "self_message_arrow", "self_message_dotted_arrow"):
+                continue
+            pos = _geo_pos(s)
+            if pos is None or not (fy1 <= pos[1] <= fy2):
+                continue
+            msgs.append({
+                "y": pos[1],
+                "from": str(s.get("from", "") or s.get("startLifeline", "") or ""),
+                "to": str(s.get("to", "") or s.get("endLifeline", "") or ""),
+                "type": s.get("type"),
+            })
+        template = msgs[0] if msgs else None
+
+        bounds = [g[0] for g in guards] + [fy2]
+        for idx, (gy, gtext) in enumerate(guards):
+            lower, upper = gy, bounds[idx + 1]
+            count_in_operand = sum(1 for m in msgs if lower <= m["y"] < upper)
+            if count_in_operand == 0:
+                auto_fix = {"fixable": False}
+                if template:
+                    auto_fix = {
+                        "fixable": True, "action": "add_arrow",
+                        "from_element": template["from"], "to_element": template["to"],
+                        "message_label": gtext,
+                        "arrow_type": template["type"] if template["type"] in
+                        ("dashed_arrow", "dotted_arrow", "arrow") else "dashed_arrow",
+                    }
+                errors.append({
+                    "error_type": "MISSING_MESSAGE_IN_FRAGMENT",
+                    "severity": "ERROR",
+                    "element": f"[{gtext}]",
+                    "description": f"The alt/opt operand '[{gtext}]' has no message arrow inside it.",
+                    "suggestion": f"Add the expected message/response arrow inside the '[{gtext}]' operand.",
+                    "auto_fix": auto_fix,
+                })
+
     if scenario and not has_fragment:
         cond_kw = ("if ", "if,", "otherwise", "else", "in case", "when ",
                    "either", " or ", "depending on", "based on whether")
@@ -1440,7 +1690,8 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         # Sequence diagram - handled by rule engine
         "unlabelled_arrow", "unlabelled_lifeline", "unlabelled_object",
         "wrong_arrow_type", "missing_activation", "missing_deletion_symbol",
-        "missing_alt_fragment",
+        "missing_alt_fragment", "incomplete_message_label",
+        "missing_message_in_fragment",
     }
 
     existing      = _existing_names(clean_shapes)
@@ -2134,6 +2385,8 @@ Examples:
 14. MISSING_ALT_FRAGMENT — Conditional logic in scenario not shown as alt/opt fragment.
 15. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
 16. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow (ERROR).
+17. INCOMPLETE_MESSAGE_LABEL — A message arrow's label is cut short compared to the scenario's wording (e.g. 'request with' when the scenario says 'request withdrawal', or 'insert card' when the scenario says 'insert card and pin'). WARNING.
+18. MISSING_MESSAGE_IN_FRAGMENT — An alt/opt operand has a guard condition (e.g. '[sufficient balance]') drawn but no message arrow inside that operand's section of the fragment. ERROR.
 
 ## SEVERITY — CRITICAL:
 - ERROR (red): Missing lifelines, missing messages, wrong arrow type, invalid source/target, missing alt fragment
@@ -2166,6 +2419,8 @@ AUTO-FIX RULES:
 - EXTRA_LIFELINE → fixable: false
 - INVALID_MESSAGE_SOURCE / INVALID_MESSAGE_TARGET → fixable: false
 - SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
+- INCOMPLETE_MESSAGE_LABEL → fixable: true, action: rename_shape, name: <full label from scenario>
+- MISSING_MESSAGE_IN_FRAGMENT → fixable: true, action: add_arrow, from_element, to_element, message_label: <the operand's guard text>, arrow_type: dashed_arrow
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -2375,6 +2630,8 @@ _SEQUENCE_SEVERITY_MAP = {
     "missing_deletion_symbol": "WARNING",
     "no_deletion_symbols":     "INFO",
     "spelling_mistake":        "WARNING",
+    "incomplete_message_label": "WARNING",
+    "missing_message_in_fragment": "ERROR",
 }
 
 
@@ -2628,7 +2885,9 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 10. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow.
 11. MISSING_ALT_FRAGMENT — Conditional logic in scenario not shown as alt/opt fragment.
 12. MISSING_ACTIVATION — Lifeline that receives messages has no activation bar.
-13. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element."""
+13. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
+14. INCOMPLETE_MESSAGE_LABEL — A message arrow's text is visibly cut short compared to what the scenario describes (e.g. "request with" when the scenario says "request withdrawal").
+15. MISSING_MESSAGE_IN_FRAGMENT — An alt/opt operand's guard condition (e.g. "[sufficient balance]") is drawn but that operand's section has no message arrow inside it."""
         dtype_label = "SEQUENCE"
         extra_rules = """
 ## RETURN MESSAGE RULES — CRITICAL:
