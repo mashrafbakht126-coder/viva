@@ -1361,44 +1361,29 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             })
 
     # ── FIX 3: Check for deletion symbols ──
-    # Build lifeline x-centers AND vertical spans so a deletion marker can be
-    # matched to the lifeline it visually sits under, in ADDITION to its
-    # name/ref field. A marker's 'lifeline'/'on'/'name' ref is not always
-    # reliable (e.g. it can be blank or point at the wrong id), which
-    # previously caused a marker that IS present on the diagram to be
-    # reported as missing on the wrong lifeline, while a lifeline truly
-    # missing its marker was never checked at all. Geometry is used as the
-    # primary signal when available, since a deletion marker's on-screen
-    # position under a lifeline is unambiguous; the name ref is a fallback.
-    #
-    # X-distance alone can misfire when two lifelines are matched by
-    # nearest-X only and something throws that off, so we also require the
-    # marker to be vertically at or below that lifeline's own top edge
-    # (with a small tolerance) — a marker floating above where a lifeline
-    # even starts can't really belong to it, which rules out accidental
-    # cross-matches to a lifeline that merely happens to be the closest in X.
-    lifeline_bounds: Dict[str, tuple] = {}   # name -> (x_center, y_top, y_bottom)
+    # Build lifeline x-centers so a deletion marker can be matched to the
+    # lifeline it visually sits under, in ADDITION to its name/ref field.
+    # A marker's 'lifeline'/'on'/'name' ref is not always reliable (e.g. it
+    # can be blank or point at the wrong id), which previously caused a
+    # marker that IS present on the diagram to be reported as missing on
+    # the wrong lifeline, while a lifeline truly missing its marker was
+    # never checked at all. Geometry is used as the primary signal when
+    # available, since a deletion marker's on-screen position under a
+    # lifeline is unambiguous; the name ref is kept as a fallback.
+    lifeline_x: Dict[str, float] = {}
     for s in shapes:
         if s.get("type") in ("lifeline", "object_lifeline", "actor"):
             ln = _n(_shape_name(s))
             pos = _geo_pos(s)
             if ln and pos is not None:
-                w, h = _geo_size(s)
-                x_center = pos[0] + w / 2.0
-                y_top, y_bottom = pos[1], pos[1] + h
-                if ln in lifeline_bounds:
-                    ox, oyt, oyb = lifeline_bounds[ln]
-                    x_center = ox  # keep first-seen x
-                    y_top, y_bottom = min(oyt, y_top), max(oyb, y_bottom)
-                lifeline_bounds[ln] = (x_center, y_top, y_bottom)
+                w, _h = _geo_size(s)
+                lifeline_x[ln] = pos[0] + w / 2.0
 
-    def _seq_nearest_lifeline_by_x(x: float, y: float) -> Optional[str]:
-        if not lifeline_bounds:
+    def _seq_nearest_lifeline_by_x(x: float) -> Optional[str]:
+        if not lifeline_x:
             return None
         best_n, best_d = None, None
-        for ln, (lx, ly_top, _ly_bottom) in lifeline_bounds.items():
-            if y < ly_top - 60:   # marker sits above where this lifeline even starts
-                continue
+        for ln, lx in lifeline_x.items():
             d = abs(lx - x)
             if best_d is None or d < best_d:
                 best_d, best_n = d, ln
@@ -1412,7 +1397,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             pos = _geo_pos(s)
             if pos is not None:
                 w, _h = _geo_size(s)
-                matched = _seq_nearest_lifeline_by_x(pos[0] + w / 2.0, pos[1])
+                matched = _seq_nearest_lifeline_by_x(pos[0] + w / 2.0)
             if not matched:
                 ref = str(s.get("lifeline", "") or s.get("on", "") or s.get("name", "") or "")
                 if ref:
@@ -1496,11 +1481,12 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         if not guard1 and not guard2:
             continue
 
+        box_h = max(fy2 - fy1, 1.0)
+        divider_y = fy1 + box_h * 0.5
         # Generous tolerance: the fragment's stored size can lag behind a
         # manual resize done in the editor (e.g. after arrows are added
         # lower down), so messages are matched against a wide margin
         # around the box rather than a hard cut exactly at its edges.
-        box_h = max(fy2 - fy1, 1.0)
         margin_top = max(40.0, box_h * 0.15)
         margin_bottom = max(200.0, box_h * 1.0)
         region_top = fy1 - margin_top
@@ -1508,9 +1494,9 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
 
         operands = []
         if guard1:
-            operands.append(guard1)
+            operands.append((region_top, divider_y, guard1))
         if guard2:
-            operands.append(guard2)
+            operands.append((divider_y, region_bottom, guard2))
         if not operands:
             continue
 
@@ -1529,48 +1515,35 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "type": s.get("type"),
             })
 
-        # NOTE: we deliberately no longer split this region into an upper/
-        # lower half at a fixed 50% divider. The fragment's stored size is
-        # not reliably kept in sync with the box actually drawn/resized in
-        # the editor, so a fixed-percentage divider regularly lands in the
-        # wrong place — which was reporting BOTH operands as empty even on
-        # a correctly-drawn diagram (arrows just fell on the "wrong" side of
-        # a divider computed from stale numbers).
-        #
-        # Instead: if we found at least as many message arrows near the
-        # fragment as there are operands, trust the diagram and stay
-        # silent — don't guess which operand each one belongs to. Only
-        # flag a genuine shortfall (fewer arrows than operands), and even
-        # then report it as one combined, non-blaming error rather than
-        # confidently naming the wrong operand.
-        if len(msgs) >= len(operands):
+        # Safety net: if the geometry doesn't line up with ANY message near
+        # this fragment at all (e.g. a stale/lagging stored box size), we
+        # can't trust the bucketing for this diagram — stay silent instead
+        # of risking a false positive on every operand. Only proceed once
+        # we've actually found real messages to reason about.
+        if not msgs:
             continue
+        template = msgs[0]
 
-        template = msgs[0] if msgs else None
-        auto_fix = {"fixable": False}
-        if template and len(operands) - len(msgs) == 1:
-            # Exactly one operand short — safe to suggest adding one arrow,
-            # but we don't claim to know which operand's guard it belongs to.
-            auto_fix = {
-                "fixable": True, "action": "add_arrow",
-                "from_element": template["from"], "to_element": template["to"],
-                "message_label": operands[-1],
-                "arrow_type": template["type"] if template["type"] in
-                ("dashed_arrow", "dotted_arrow", "arrow") else "dashed_arrow",
-            }
-        guard_list = ", ".join(f"'{g}'" for g in operands)
-        errors.append({
-            "error_type": "MISSING_MESSAGE_IN_FRAGMENT",
-            "severity": "ERROR",
-            "element": guard_list,
-            "description": (
-                f"This alt fragment has {len(operands)} operand(s) ({guard_list}) "
-                f"but only {len(msgs)} message arrow(s) were found inside it — "
-                f"at least one operand appears to be missing its message."
-            ),
-            "suggestion": "Make sure every alt/opt operand has its own message or response arrow inside it.",
-            "auto_fix": auto_fix,
-        })
+        for lower, upper, gtext in operands:
+            count_in_operand = sum(1 for m in msgs if lower <= m["y"] < upper)
+            if count_in_operand == 0:
+                auto_fix = {"fixable": False}
+                if template:
+                    auto_fix = {
+                        "fixable": True, "action": "add_arrow",
+                        "from_element": template["from"], "to_element": template["to"],
+                        "message_label": gtext,
+                        "arrow_type": template["type"] if template["type"] in
+                        ("dashed_arrow", "dotted_arrow", "arrow") else "dashed_arrow",
+                    }
+                errors.append({
+                    "error_type": "MISSING_MESSAGE_IN_FRAGMENT",
+                    "severity": "ERROR",
+                    "element": gtext,
+                    "description": f"The alt operand '{gtext}' has no message arrow inside it.",
+                    "suggestion": f"Add the expected message/response arrow inside the '{gtext}' operand.",
+                    "auto_fix": auto_fix,
+                })
 
     if scenario and not has_fragment:
         cond_kw = ("if ", "if,", "otherwise", "else", "in case", "when ",
