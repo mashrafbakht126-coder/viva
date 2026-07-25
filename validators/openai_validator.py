@@ -89,6 +89,19 @@ _TOOLTYPE_MAP = {
     "activation":           "activation_box",
     "deletion":             "deletion_marker",
     "fragment":             "combined_fragment",
+    "combinedfragment":     "combined_fragment",
+    "altfragment":          "combined_fragment",
+    "optfragment":          "combined_fragment",
+    "loopfragment":         "combined_fragment",
+    "parfragment":          "combined_fragment",
+    "interactionframe":     "combined_fragment",
+    "sequenceframe":        "combined_fragment",
+    "frame":                "combined_fragment",
+    "framebox":             "combined_fragment",
+    "alt":                  "combined_fragment",
+    "opt":                  "combined_fragment",
+    "loop":                 "combined_fragment",
+    "par":                  "combined_fragment",
     "selfmessagearrow":     "self_message_arrow",
     "selfmessagedottedarrow": "self_message_dotted_arrow",
     "text":                 "text_label",
@@ -129,7 +142,14 @@ def _clean_type(raw_type: str) -> str:
     if "." in t:
         t = t.split(".")[-1]            # 'ToolType.classFullShape' → 'classfullshape'
     t = re.sub(r"[_\-]", "", t)        # drop separators before lookup
-    return _TOOLTYPE_MAP.get(t, t)
+    if t in _TOOLTYPE_MAP:
+        return _TOOLTYPE_MAP[t]
+    # Fallback: any unmapped type that still clearly names a combined
+    # fragment (alt/opt/loop/par box) should normalize to combined_fragment
+    # instead of falling through unrecognized and getting filtered out.
+    if "fragment" in t or "combinedfrag" in t:
+        return "combined_fragment"
+    return t
 
 
 def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
@@ -1242,7 +1262,16 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     # simultaneously added to SKIP_FROM_LLM in _merge_results — meaning the
     # LLM's own detection got dropped AND nothing replaced it, so the error
     # could never appear. This now does the real deterministic check.
-    has_fragment = any(s.get("type") in ("combined_fragment", "fragment") for s in shapes)
+    def _is_fragment_shape(s: Dict) -> bool:
+        t = _n(str(s.get("type", "")))
+        if t in ("combined_fragment", "fragment"):
+            return True
+        # Defensive fallback: catch any type name that still clearly
+        # refers to an alt/opt/loop/par combined-fragment box even if it
+        # slipped through _clean_type unmapped (e.g. custom ToolType names).
+        return "fragment" in t or t in ("alt", "opt", "loop", "par", "frame")
+
+    has_fragment = any(_is_fragment_shape(s) for s in shapes)
     if scenario and not has_fragment:
         cond_kw = ("if ", "if,", "otherwise", "else", "in case", "when ",
                    "either", " or ", "depending on", "based on whether")
