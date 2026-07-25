@@ -2432,6 +2432,7 @@ def validate_with_openai(
     shapes:         List[Dict[str, Any]],
     diagram_type:   str = "class",
     ignored_errors: Optional[List[str]] = None,
+    extracted:      Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Validate any diagram type using OpenAI.
