@@ -236,6 +236,14 @@ def validate():
 
     # ── NLP extraction ─────────────────────────────────────────────────────
     extracted = extractor.extract(scenario)
+     # ── TEMP DEBUG: dump incoming payload so we can inspect real shape data ─
+    try:
+        import json as _json
+        with open('/tmp/last_request.json', 'w') as _f:
+            _json.dump({"scenario": scenario, "diagram_type": dtype, "shapes": shapes}, _f, indent=2)
+        _log.info("DEBUG: dumped request payload to /tmp/last_request.json")
+    except Exception as _e:
+        _log.warning("DEBUG dump failed: %s", _e)
 
     # ── OpenAI AI first (PRIMARY) ──────────────────────────────────────────
     # when image available → use OpenAI Vision  (analyzeimage directly )
