@@ -13,6 +13,16 @@ FIX: Shape sanitizer added — strips ToolType. prefix, filters shapes by
      diagram type so OpenAI never sees actor/systemBoundary shapes when
      validating a class diagram (and vice versa).
      Prompt headers now explicitly forbid cross-diagram rules.
+
+SEQUENCE DIAGRAM FIXES (2026-07-24):
+  1. Return arrows now correctly validated as dashed arrows (WRONG_ARROW_TYPE)
+  2. Alt fragments, deletion markers, activation bars, object lifelines now validated
+  3. Fix for return arrows no longer shows "include" arrow type
+  4. Multiple return messages no longer merged into one
+  5. Consistent error lists with deterministic rule checks
+  6. Proper severity mapping (ERROR/WARNING/INFO) for sequence diagrams
+  7. Return arrow direction correctly maintained in fixes
+  8. fixable: true properly set for sequence diagram auto-fixes
 """
 
 import os
@@ -169,6 +179,35 @@ def _sanitize_shapes(shapes: List[Dict], diagram_type: str) -> List[Dict]:
 # Jab Gemini fixable: true nahi deta, hum error_type se apna fix banate hain
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _parse_from_to(text: str):
+    """Try to extract 'from X to Y' or 'X and Y' or quoted names from text."""
+    import re as _re
+    # Pattern: from 'X' to 'Y'
+    m = _re.search(r"from ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]? to ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]?(?:\s|$|\.)", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # Pattern: between 'X' and 'Y'
+    m = _re.search(r"between ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]? and ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]?(?:\s|$|\.)", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    # Pattern: 'X' class and the 'Y' class
+    m = _re.search(r"['\"]([A-Za-z][A-Za-z0-9_\s]*?)['\"] class and the ['\"]([A-Za-z][A-Za-z0-9_\s]*?)['\"]", text)
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None, None
+
+
+def _guess_arrow_type(text: str, diagram_type: str) -> str:
+    """Guess the best arrow type from description/suggestion text."""
+    if "composition" in text:   return "composition"
+    if "aggregation" in text:   return "aggregation"
+    if "generalization" in text or "inherit" in text: return "generalization"
+    if "dependency" in text or "depend" in text:      return "dependency"
+    if "include" in text:       return "include"
+    if "extend" in text:        return "extend"
+    return "association"
+
+
 def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_type: str, scenario: str = "") -> dict:
     """
     Gemini ka auto_fix agar incomplete/missing ho — error_type se fallback fix banao.
@@ -204,7 +243,7 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
                         "from_element": from_el, "to_element": to_el, "name": label}
         return {"fixable": False}
 
-    if "MISSING_RELATIONSHIP" in et or "MISSING_RELATIONSHIP" in et:
+    if "MISSING_RELATIONSHIP" in et:
         # Try to parse from_element and to_element from description/suggestion
         from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
         arrow = _guess_arrow_type(desc + " " + suggestion.lower(), diagram_type)
@@ -267,51 +306,95 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
         return {"fixable": True, "action": "rename_shape", "name": name}
 
     # ── SEQUENCE DIAGRAM ──────────────────────────────────────────────────────
+    # FIX 1: Return arrow must be dashed arrow
+    if "WRONG_ARROW_TYPE" in et:
+        from_el = str(raw_error.get("from_element", ""))
+        to_el = str(raw_error.get("to_element", ""))
+        if not (from_el and to_el):
+            from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
+        if from_el and to_el:
+            return {"fixable": True, "action": "change_arrow_type",
+                    "from_element": from_el, "to_element": to_el,
+                    "arrow_type": "dashed_arrow"}
+        return {"fixable": False}
+
     if "MISSING_LIFELINE" in et:
         return {"fixable": True, "action": "add_shape", "shape_type": "lifeline", "name": element or "Participant"}
 
-    if "EMPTY_LIFELINE_NAME" in et:
+    if "EMPTY_LIFELINE_NAME" in et or "UNLABELLED_LIFELINE" in et:
         return {"fixable": True, "action": "rename_shape", "name": element or "Participant"}
 
-    if "MISSING_MESSAGE" in et or "MISSING_RETURN" in et:
+    if "UNLABELLED_OBJECT" in et:
+        return {"fixable": True, "action": "rename_shape", "name": element or "Object"}
+
+    if "UNLABELLED_ARROW" in et:
+        return {"fixable": True, "action": "rename_shape", "name": element or "message"}
+
+    # FIX 2 (corrected): Missing return message.
+    # NOTE: earlier this always reversed the parsed from/to on the assumption
+    # that the description names the *original call's* direction. That is not
+    # always true — the LLM often writes the description as the direction the
+    # RETURN arrow itself should take (e.g. "Add a message arrow for
+    # insufficient balance from ATM to Customer"). Blindly reversing that
+    # produced exactly the wrong-direction bug that was reported. We now
+    # trust whatever direction is explicitly stated, unmodified, and only
+    # reverse as a last resort when we have to infer it from the matching
+    # forward call already present on the diagram.
+    if "MISSING_RETURN" in et or "missing return" in et.lower():
+        from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
+        if from_el and to_el:
+            return {"fixable": True, "action": "add_arrow",
+                    "from_element": from_el, "to_element": to_el,
+                    "message_label": element or "return",
+                    "arrow_type": "dashed_arrow"}
+        # Try to parse from raw_error fields — again, no forced reversal
+        frm = str(raw_error.get("from_element", ""))
+        to = str(raw_error.get("to_element", ""))
+        if frm and to:
+            return {"fixable": True, "action": "add_arrow",
+                    "from_element": frm, "to_element": to,
+                    "message_label": element or "return",
+                    "arrow_type": "dashed_arrow"}
+        return {"fixable": False}
+
+    if "MISSING_MESSAGE" in et:
         from_el, to_el = _parse_from_to(desc + " " + suggestion.lower())
         arrow = "dashed_arrow" if "return" in et.lower() or "response" in desc else "arrow"
         if from_el and to_el:
             return {"fixable": True, "action": "add_arrow",
                     "from_element": from_el, "to_element": to_el,
-                    "message_label": element or "", "arrow_type": arrow}
+                    "message_label": element or "message", "arrow_type": arrow}
+        # Try to parse from raw_error fields
+        frm = str(raw_error.get("from_element", ""))
+        to = str(raw_error.get("to_element", ""))
+        if frm and to:
+            return {"fixable": True, "action": "add_arrow",
+                    "from_element": frm, "to_element": to,
+                    "message_label": element or "message", "arrow_type": arrow}
+        return {"fixable": False}
+
+    # FIX 3: Missing alt fragment
+    if "MISSING_ALT_FRAGMENT" in et:
+        return {"fixable": True, "action": "add_shape", "shape_type": "combined_fragment", 
+                "name": "alt"}
+
+    # FIX 4: Missing activation bar
+    if "MISSING_ACTIVATION" in et:
+        return {"fixable": True, "action": "add_shape", "shape_type": "activation_box",
+                "name": element, "lifelineRef": element}
+
+    # FIX 5: Missing deletion symbol
+    if "MISSING_DELETION_SYMBOL" in et:
+        return {"fixable": True, "action": "add_shape", "shape_type": "deletion_marker",
+                "name": element}
+
+    if "ISOLATED_LIFELINE" in et:
+        return {"fixable": False}
+
+    if "EXTRA_LIFELINE" in et:
         return {"fixable": False}
 
     return {"fixable": False}
-
-
-def _parse_from_to(text: str):
-    """Try to extract 'from X to Y' or 'X and Y' or quoted names from text."""
-    import re as _re
-    # Pattern: from 'X' to 'Y'
-    m = _re.search(r"from ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]? to ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]?(?:\s|$|\.)", text)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    # Pattern: between 'X' and 'Y'
-    m = _re.search(r"between ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]? and ['\"]?([A-Za-z][A-Za-z0-9_\s]*?)['\"]?(?:\s|$|\.)", text)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    # Pattern: 'X' class and the 'Y' class
-    m = _re.search(r"['\"]([A-Za-z][A-Za-z0-9_\s]*?)['\"] class and the ['\"]([A-Za-z][A-Za-z0-9_\s]*?)['\"]", text)
-    if m:
-        return m.group(1).strip(), m.group(2).strip()
-    return None, None
-
-
-def _guess_arrow_type(text: str, diagram_type: str) -> str:
-    """Guess the best arrow type from description/suggestion text."""
-    if "composition" in text:   return "composition"
-    if "aggregation" in text:   return "aggregation"
-    if "generalization" in text or "inherit" in text: return "generalization"
-    if "dependency" in text or "depend" in text:      return "dependency"
-    if "include" in text:       return "include"
-    if "extend" in text:        return "extend"
-    return "association"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1001,11 +1084,16 @@ def _rule_check_class(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     return errors
 
 
-def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
+# ─────────────────────────────────────────────────────────────────────────────
+# SEQUENCE DIAGRAM RULE CHECKS — FIXED with proper validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for sequence diagrams."""
     errors = []
     lifelines = {}
 
+    # ── Collect lifelines ──
     for s in shapes:
         t = s.get("type", "")
         if t not in ("lifeline", "object_lifeline", "actor"):
@@ -1013,13 +1101,23 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
         name = _shape_name(s)
         n    = _n(name)
         if not n:
-            errors.append({
-                "error_type": "UNLABELLED_LIFELINE", "severity": "ERROR",
-                "element": "(unnamed)",
-                "description": "A lifeline has no name.",
-                "suggestion": "Give this lifeline a meaningful name.",
-                "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
-            })
+            # FIX: Use correct terminology for object vs lifeline
+            if t == "object_lifeline" or t == "object":
+                errors.append({
+                    "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
+                    "element": "(unnamed object)",
+                    "description": "An object lifeline has no name.",
+                    "suggestion": "Give this object a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Object"},
+                })
+            else:
+                errors.append({
+                    "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
+                    "element": "(unnamed lifeline)",
+                    "description": "A lifeline has no name.",
+                    "suggestion": "Give this lifeline a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
+                })
         elif n in lifelines:
             errors.append({
                 "error_type": "DUPLICATE_LIFELINE", "severity": "WARNING",
@@ -1031,18 +1129,136 @@ def _rule_check_sequence(shapes: List[Dict]) -> List[Dict]:
         else:
             lifelines[n] = name
 
+    # ── Check for unlabelled arrows ──
+    arrow_count = 0
     for s in shapes:
-        if s.get("type") not in ("arrow", "dashed_arrow"):
+        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow", 
+                             "self_message_arrow", "self_message_dotted_arrow"):
+            arrow_count += 1
+            label = str(s.get("label") or s.get("text") or "").strip()
+            if _n(label) in ("", "none", "null", "undefined"):
+                errors.append({
+                    "error_type": "UNLABELLED_ARROW", "severity": "WARNING",
+                    "element": "(unlabelled arrow)",
+                    "description": "A message arrow has no label.",
+                    "suggestion": "Add a message name to this arrow.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
+                })
+
+    # ── FIX 1: Check return arrow types (WRONG_ARROW_TYPE) ──
+    for s in shapes:
+        if s.get("type") not in ("arrow", "dashed_arrow", "dotted_arrow"):
             continue
-        label = str(s.get("label") or s.get("text") or "").strip()
-        if _n(label) in ("", "none", "null", "undefined"):
+        label = str(s.get("label") or s.get("text") or "").strip().lower()
+        # Check if this is a return/response message
+        is_return = any(kw in label for kw in ("return", "response", "result", "reply", "confirm", "ack"))
+        
+        # If it's a return message and uses solid arrow (type "arrow") → WRONG_ARROW_TYPE
+        if is_return and s.get("type") == "arrow":
+            frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
+            to = str(s.get("to", "") or s.get("endLifeline", "") or "")
             errors.append({
-                "error_type": "UNLABELLED_ARROW", "severity": "WARNING",
-                "element": "(unlabelled arrow)",
-                "description": "A message arrow has no label.",
-                "suggestion": "Add a message name to this arrow.",
-                "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
+                "error_type": "WRONG_ARROW_TYPE",
+                "severity": "ERROR",
+                "element": label or "(return message)",
+                "description": f"Return/response message '{label}' is using a solid arrow. Return messages MUST use dashed arrows.",
+                "suggestion": f"Change the arrow from solid to dashed for the return message '{label}'.",
+                "auto_fix": {"fixable": True, "action": "change_arrow_type", 
+                             "from_element": frm, "to_element": to,
+                             "arrow_type": "dashed_arrow"},
             })
+
+    # ── FIX 2: Check for activation bars ──
+    # Collect lifelines that receive messages
+    receivers = set()
+    for s in shapes:
+        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
+            to = str(s.get("to", "") or s.get("endLifeline", "") or "")
+            if to:
+                receivers.add(_n(to))
+    
+    # Collect lifelines that have activation bars
+    activations = set()
+    for s in shapes:
+        if s.get("type") == "activation_box":
+            ref = str(s.get("lifelineRef", "") or s.get("name", "") or "")
+            if ref:
+                activations.add(_n(ref))
+    
+    # Check for missing activations
+    for receiver in receivers:
+        if receiver in lifelines and receiver not in activations:
+            errors.append({
+                "error_type": "MISSING_ACTIVATION",
+                "severity": "WARNING",
+                "element": lifelines.get(receiver, receiver),
+                "description": f"Lifeline '{lifelines.get(receiver, receiver)}' receives messages but has no activation bar.",
+                "suggestion": f"Add an activation bar on the lifeline '{lifelines.get(receiver, receiver)}'.",
+                "auto_fix": {"fixable": True, "action": "add_shape", 
+                             "shape_type": "activation_box", "name": receiver,
+                             "lifelineRef": receiver},
+            })
+
+    # ── FIX 3: Check for deletion symbols ──
+    # Collect lifelines that have deletion markers
+    deletions = set()
+    for s in shapes:
+        if s.get("type") in ("deletion_marker", "deletion", "destroy", "x", "cross"):
+            ref = str(s.get("lifeline", "") or s.get("on", "") or s.get("name", "") or "")
+            if ref:
+                deletions.add(_n(ref))
+    
+    # Check for missing deletions (only for lifelines that appear to end)
+    # We check if a lifeline has any outgoing messages (suggests it's active and might need deletion)
+    active_lifelines = set()
+    for s in shapes:
+        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
+            frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
+            if frm:
+                active_lifelines.add(_n(frm))
+    
+    for lifeline in active_lifelines:
+        if lifeline in lifelines and lifeline not in deletions:
+            # Only warn if there are multiple messages (suggests lifeline ends)
+            msg_count = 0
+            for s in shapes:
+                if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
+                    frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
+                    if _n(frm) == lifeline:
+                        msg_count += 1
+            if msg_count >= 2:  # If lifeline sends multiple messages, it likely ends
+                errors.append({
+                    "error_type": "MISSING_DELETION_SYMBOL",
+                    "severity": "WARNING",
+                    "element": lifelines.get(lifeline, lifeline),
+                    "description": f"Lifeline '{lifelines.get(lifeline, lifeline)}' may need a deletion marker (X) at its end.",
+                    "suggestion": f"Add a deletion marker (X) at the bottom of lifeline '{lifelines.get(lifeline, lifeline)}'.",
+                    "auto_fix": {"fixable": True, "action": "add_shape", 
+                                 "shape_type": "deletion_marker", "name": lifeline},
+                })
+
+    # ── FIX 4: Check for alt fragments (now actually implemented) ──────────────
+    # Previously this was a no-op comment while "missing_alt_fragment" was
+    # simultaneously added to SKIP_FROM_LLM in _merge_results — meaning the
+    # LLM's own detection got dropped AND nothing replaced it, so the error
+    # could never appear. This now does the real deterministic check.
+    has_fragment = any(s.get("type") in ("combined_fragment", "fragment") for s in shapes)
+    if scenario and not has_fragment:
+        cond_kw = ("if ", "if,", "otherwise", "else", "in case", "when ",
+                   "either", " or ", "depending on", "based on whether")
+        scen_l = f" {scenario.lower()} "
+        looks_conditional = any(kw in scen_l for kw in cond_kw)
+        if looks_conditional:
+            errors.append({
+                "error_type": "MISSING_ALT_FRAGMENT",
+                "severity": "ERROR",
+                "element": "(diagram)",
+                "description": "The scenario describes conditional/alternative behaviour, but no alt/opt fragment is drawn.",
+                "suggestion": "Wrap the conditional messages in an alt (or opt) combined fragment with at least 2 operands.",
+                "auto_fix": {"fixable": True, "action": "add_shape",
+                             "shape_type": "combined_fragment", "name": "alt"},
+            })
+
     return errors
 
 
@@ -1053,7 +1269,7 @@ def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "") 
     elif "class" in dt:
         return _rule_check_class(shapes, scenario)
     elif "sequence" in dt:
-        return _rule_check_sequence(shapes)
+        return _rule_check_sequence(shapes, scenario)
     return []
 
 
@@ -1192,7 +1408,10 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
         "self_referential", "incorrect_self_reference",
         "incorrect_relationship", "incorrect_actor_relationship",
         "actor_self_relationship", "invalid_relationship",
-        # wrong_multiplicity is now ENABLED — removed from skip list
+        # Sequence diagram - handled by rule engine
+        "unlabelled_arrow", "unlabelled_lifeline", "unlabelled_object",
+        "wrong_arrow_type", "missing_activation", "missing_deletion_symbol",
+        "missing_alt_fragment",
     }
 
     existing      = _existing_names(clean_shapes)
@@ -1365,8 +1584,10 @@ def _merge_results(rule_errors: List[Dict], llm_errors: List[Dict],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROMPT BUILDERS — alag diagram type ke liye alag prompt
+# PROMPT BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─── CLASS DIAGRAM PROMPT (UNCHANGED) ──────────────────────────────────────
 
 def _prompt_class(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Class Diagram validator using SEMANTIC analysis.
@@ -1605,6 +1826,8 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 """
 
 
+# ─── USE CASE DIAGRAM PROMPT (UNCHANGED) ──────────────────────────────────
+
 def _prompt_usecase(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Use Case Diagram validator.
 
@@ -1761,16 +1984,20 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 """
 
 
+# ─── SEQUENCE DIAGRAM PROMPT (FIXED) ──────────────────────────────────────
+
 def _prompt_sequence(scenario: str, shapes: List[Dict]) -> str:
     return f"""You are an expert UML Sequence Diagram validator using SEMANTIC analysis.
 
 ## TASK
 This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Return ONLY valid JSON.
 
-## ABSOLUTE RESTRICTIONS:
-- Do NOT check for class boxes, system boundaries, or use cases.
-- Do NOT report MISSING_CLASS, MISSING_SYSTEM_BOUNDARY, MISSING_USE_CASE.
-- Do NOT apply class diagram or use case diagram rules of any kind.
+## ABSOLUTE RESTRICTIONS — STRICT ENFORCEMENT:
+- This is SEQUENCE DIAGRAM ONLY.
+- Do NOT check for: classes, attributes, methods, system boundaries, use cases, actors (in use case sense).
+- Do NOT report: MISSING_CLASS, MISSING_ACTOR (use case), MISSING_SYSTEM_BOUNDARY, MISSING_USE_CASE.
+- If you see these rules in the prompt, IGNORE THEM — they do NOT apply to sequence diagrams.
+- When in doubt, SKIP the error — sequence diagrams have different rules from class/use case diagrams.
 
 ## SCENARIO
 {scenario}
@@ -1791,7 +2018,8 @@ This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Retur
 - `"text"` or `"label"` = actor's name.
 
 ### Message arrows:
-- Types: `arrow`, `dashed_arrow`, `dotted_arrow` → horizontal arrows between lifelines.
+- Types: `arrow` (SOLID) → request/call messages ONLY.
+- Types: `dashed_arrow`, `dotted_arrow` → return/response messages ONLY.
 - `"from"` / `"to"` = source and target lifeline names.
 - `"label"` or `"text"` = the message/operation name.
 - `"type": "self_message_arrow"` or `"selfmessagearrow"` → self-message (same lifeline sends to itself). This is VALID in UML — do NOT report it as an error unless it has no label.
@@ -1804,9 +2032,11 @@ This is a SEQUENCE DIAGRAM. Validate it using ONLY sequence diagram rules. Retur
 
 ### Activation boxes:
 - Types: `activation_box`, `activation` → thin rectangle on a lifeline's dashed line.
+- Any lifeline that receives a message MUST have an activation box.
 
 ### Combined fragments:
 - Types: `combined_fragment`, `fragment` → alt/opt/loop/par boxes.
+- Alt fragments must have at least 2 operands (e.g., "success" and "failure").
 
 ## SEMANTIC ANALYSIS — READ THIS CAREFULLY:
 You must use SEMANTIC reasoning. Different students may label messages differently but mean the same thing. A diagram is correct if its overall interaction logic matches the scenario's intent.
@@ -1815,6 +2045,32 @@ Examples:
 - "validateUser()" and "validate credentials" both represent the same login validation step → semantically the same.
 - "loginResponse" and "authToken returned" both represent the login result → same.
 - Message order is correct if the LOGICAL sequence matches the scenario, even if exact wording differs.
+
+## RETURN MESSAGE RULES — CRITICAL:
+- Return/response messages MUST use dashed_arrow (dotted/dashed line).
+- Solid arrows (arrow) are for request/call messages ONLY.
+- If a message is a response (returns value, confirms action, provides result), it must be dashed.
+- Mismatch → report WRONG_ARROW_TYPE as ERROR.
+- For each request message that expects a response, there must be a SEPARATE return arrow.
+- Do NOT merge multiple responses into one arrow.
+- Example: "validate PIN" → "valid/invalid response" is ONE pair. "check balance" → "balance" is ANOTHER separate pair.
+- Return arrow direction: from the receiver back to the sender (reverse direction of the request).
+
+## ALT FRAGMENT RULES:
+- If scenario has conditions/alternatives (if/else, switch/case, "if X then Y else Z"), there MUST be alt fragment boxes.
+- Each alt fragment must have at least 2 operands.
+- Missing alt fragment → report MISSING_ALT_FRAGMENT as ERROR.
+
+## ACTIVATION BAR RULES:
+- Any lifeline that receives a message MUST have activation box on its line.
+- Activation box = thin rectangle on the lifeline's dashed line.
+- Missing activation → report MISSING_ACTIVATION as WARNING.
+
+## DELETION SYMBOL RULES — CRITICAL:
+- Look for shapes of type `deletion_marker`, `deletion`, `destroy`, `x`, `cross`, or any X-shaped marker.
+- If deletion shapes are present in the diagram shapes list → deletion symbols EXIST. Do NOT report them as missing.
+- Only report MISSING_DELETION_SYMBOL for specific lifelines that have no associated deletion shape.
+- If the diagram uses a simple format (no deletion markers) → report NO_DELETION_SYMBOLS as INFO only (not ERROR).
 
 ## MESSAGE ORDER RULES — CRITICAL:
 - Only report WRONG_MESSAGE_ORDER if the sequence in the diagram is CLEARLY and DEFINITIVELY wrong compared to the scenario's described flow.
@@ -1827,40 +2083,37 @@ Examples:
 - Do NOT report SELF_MESSAGE as an error unless the scenario specifically says self-messages are wrong.
 - Only report INVALID_SELF_MESSAGE if a self-message arrow has no label at all.
 
-## DELETION SYMBOL RULES — CRITICAL:
-- Look for shapes of type `deletion_marker`, `deletion`, `destroy`, `x`, `cross`, or any X-shaped marker.
-- If deletion shapes are present in the diagram shapes list → deletion symbols EXIST. Do NOT report them as missing.
-- Only report MISSING_DELETION_SYMBOL for specific lifelines that have no associated deletion shape.
-- If the diagram uses a simple format (no deletion markers) → report NO_DELETION_SYMBOLS as INFO only (not ERROR).
-
 ## OBJECT vs LIFELINE NAMING:
 - An `object_lifeline` or `object` shape with a name IS a named participant — do NOT report it as having no name.
 - If an object shape's label is empty → report: "Object has no name. Add a name to the object box."
 - Do NOT say "lifeline has no name" when the shape type is `object` or `object_lifeline` — say "object has no name".
 
 ## RULES TO CHECK (sequence diagram ONLY)
-1. MISSING_LIFELINE         — Every participant/object in scenario must have a lifeline or object box.
-2. EXTRA_LIFELINE           — Lifeline not in scenario (warning).
-3. MISSING_MESSAGE          — Important interaction in scenario not shown as a message arrow. Use semantic matching.
-4. WRONG_MESSAGE_ORDER      — Messages are in CLEARLY wrong order vs scenario. Only report when certain.
-5. MISSING_RETURN           — A call message has no return/response when scenario explicitly expects one.
-6. INVALID_MESSAGE_SOURCE   — Message arrow starts from non-existent lifeline.
-7. INVALID_MESSAGE_TARGET   — Message arrow ends at non-existent lifeline.
-8. ISOLATED_LIFELINE        — Lifeline sends/receives no messages.
-9. UNLABELLED_LIFELINE      — Lifeline box has no label.
-10. UNLABELLED_OBJECT       — Object box has no label (use "object" terminology, not "lifeline").
-11. MISSING_ACTIVATION      — Lifeline that receives messages has no activation box.
+1. MISSING_LIFELINE — Every participant/object in scenario must have a lifeline or object box.
+2. EXTRA_LIFELINE — Lifeline not in scenario (warning).
+3. MISSING_MESSAGE — Important interaction in scenario not shown as a message arrow. Use semantic matching.
+4. WRONG_MESSAGE_ORDER — Messages are in CLEARLY wrong order vs scenario. Only report when certain.
+5. MISSING_RETURN — A call message has no return/response when scenario explicitly expects one.
+6. INVALID_MESSAGE_SOURCE — Message arrow starts from non-existent lifeline.
+7. INVALID_MESSAGE_TARGET — Message arrow ends at non-existent lifeline.
+8. ISOLATED_LIFELINE — Lifeline sends/receives no messages.
+9. UNLABELLED_LIFELINE — Lifeline box has no label.
+10. UNLABELLED_OBJECT — Object box has no label (use "object" terminology, not "lifeline").
+11. MISSING_ACTIVATION — Lifeline that receives messages has no activation box.
 12. MISSING_DELETION_SYMBOL — Specific lifeline has no X/destroy marker at its end.
-13. UNLABELLED_ARROW        — Message arrow has no label/name.
-14. MISSING_ALT_FRAGMENT    — Conditional logic in scenario not shown as alt/opt fragment.
-15. SPELLING_MISTAKE        — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
+13. UNLABELLED_ARROW — Message arrow has no label/name.
+14. MISSING_ALT_FRAGMENT — Conditional logic in scenario not shown as alt/opt fragment.
+15. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element.
+16. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow (ERROR).
 
-## SEVERITY
-ERROR = must fix | WARNING = should fix | INFO = suggestion
+## SEVERITY — CRITICAL:
+- ERROR (red): Missing lifelines, missing messages, wrong arrow type, invalid source/target, missing alt fragment
+- WARNING (orange): Unlabelled arrows, duplicate lifelines, missing activation, missing deletion, missing return
+- INFO (blue): Optional improvements, extra lifelines, naming suggestions
 
 ## AUTO-FIX INSTRUCTIONS
-auto_fix fields:
-- "action": one of "add_shape", "rename_shape", "add_arrow", "merge_shapes"
+For each error, provide an "auto_fix" object:
+- "action": one of "add_shape", "rename_shape", "add_arrow", "merge_shapes", "change_arrow_type"
 - "shape_type": one of "lifeline", "activation_box", "combined_fragment", "deletion_marker"
 - "name": label to set
 - "from_element": source lifeline name
@@ -1876,12 +2129,13 @@ AUTO-FIX RULES:
 - MISSING_MESSAGE → fixable: true, action: add_arrow, from_element, to_element, message_label, arrow_type: arrow
 - MISSING_RETURN → fixable: true, action: add_arrow, from_element: <receiver>, to_element: <sender>, message_label: <return label>, arrow_type: dashed_arrow
 - MISSING_DELETION_SYMBOL → fixable: true, action: add_shape, shape_type: deletion_marker, name: <lifeline name>
+- MISSING_ACTIVATION → fixable: true, action: add_shape, shape_type: activation_box, name: <lifeline name>
+- MISSING_ALT_FRAGMENT → fixable: true, action: add_shape, shape_type: combined_fragment, name: alt
+- WRONG_ARROW_TYPE → fixable: true, action: change_arrow_type, arrow_type: dashed_arrow, from_element, to_element
 - WRONG_MESSAGE_ORDER → fixable: false
 - ISOLATED_LIFELINE → fixable: false
 - EXTRA_LIFELINE → fixable: false
 - INVALID_MESSAGE_SOURCE / INVALID_MESSAGE_TARGET → fixable: false
-- MISSING_ACTIVATION → fixable: false
-- MISSING_ALT_FRAGMENT → fixable: false
 - SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 
 ## RESPONSE FORMAT (JSON only, no markdown)
@@ -1920,6 +2174,16 @@ If correct: {{"errors": [], "score": 100, "summary": "Diagram is correct"}}
 - STRICT: Only for interactions EXPLICITLY described in the scenario.
 - STRICT: Use semantic matching — "validateUser()" matches "validate credentials" — same interaction.
 - STRICT: Do NOT invent intermediate messages not in scenario.
+
+### MISSING_RETURN:
+- STRICT: Only report if scenario explicitly says there should be a response.
+- STRICT: Each request has its OWN return arrow — never merge multiple returns.
+- STRICT: Return arrow direction = from receiver TO sender (reverse of request).
+
+### WRONG_ARROW_TYPE:
+- STRICT: Return/response messages MUST use dashed_arrow.
+- STRICT: Solid arrow (arrow) is for requests/calls ONLY.
+- STRICT: If scenario says "returns", "responds", "confirms", "provides", "sends back" → expect dashed_arrow.
 
 ### WRONG_MESSAGE_ORDER:
 - STRICT: Only report if the order is CLEARLY wrong (e.g. response comes before request).
@@ -2050,6 +2314,116 @@ def make_error_fingerprint(error_type: str, element: str = "",
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SEQUENCE DIAGRAM — extra deterministic safety net applied AFTER the LLM
+# response, on top of the prompt instructions. This exists because prompt
+# instructions alone are not reliably followed by the model every run.
+# SEQUENCE-ONLY — never touches class/usecase items.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SEQUENCE_VALID_ARROW_TYPES = {
+    "arrow", "dashed_arrow", "dotted_arrow",
+    "self_message_arrow", "self_message_dotted_arrow",
+}
+
+# Fixed severity per sequence error type so the same error type always shows
+# the same colour, instead of flipping between red/orange across runs.
+_SEQUENCE_SEVERITY_MAP = {
+    "missing_lifeline":        "ERROR",
+    "missing_message":         "ERROR",
+    "missing_return":          "ERROR",
+    "wrong_arrow_type":        "ERROR",
+    "invalid_message_source":  "ERROR",
+    "invalid_message_target":  "ERROR",
+    "wrong_message_order":     "ERROR",
+    "missing_alt_fragment":    "ERROR",
+    "unlabelled_lifeline":     "WARNING",
+    "unlabelled_object":       "WARNING",
+    "unlabelled_arrow":        "WARNING",
+    "extra_lifeline":          "WARNING",
+    "duplicate_lifeline":      "WARNING",
+    "isolated_lifeline":       "WARNING",
+    "missing_activation":      "WARNING",
+    "missing_deletion_symbol": "WARNING",
+    "no_deletion_symbols":     "INFO",
+    "spelling_mistake":        "WARNING",
+}
+
+
+def _sequence_fix_arrow_type(error_type: str, description: str, suggestion: str, given: str) -> str:
+    """Reject hallucinated non-sequence arrow types (include/extend/composition/...)."""
+    g = _n(given)
+    et = error_type.lower()
+    text = (description + " " + suggestion).lower()
+    looks_like_return = ("return" in et or "return" in text or "response" in text)
+    if g in _SEQUENCE_VALID_ARROW_TYPES:
+        if looks_like_return and g == "arrow":
+            return "dashed_arrow"
+        return g
+    return "dashed_arrow" if looks_like_return else "arrow"
+
+
+def _sequence_fix_direction(description: str, from_el: str, to_el: str):
+    """
+    If the description explicitly states a direction ('... from X to Y ...'),
+    trust that text over the model's own (sometimes self-inconsistent)
+    from_element/to_element JSON fields — this is what caused the reported
+    reversed-arrow bug.
+    """
+    parsed_from, parsed_to = _parse_from_to(f" {description.lower()} ")
+    if parsed_from and parsed_to:
+        return parsed_from.strip(), parsed_to.strip()
+    return from_el, to_el
+
+
+def _split_merged_sequence_label(item: Dict) -> List[Dict]:
+    """
+    Split errors where the model merged two distinct return messages into one
+    label, e.g. 'cash dispensed/insufficient balance' — each becomes its own
+    separate, correctly-fixable error.
+    """
+    fix = item.get("auto_fix") or {}
+    label = str(fix.get("message_label") or item.get("element") or "")
+    if "/" not in label:
+        return [item]
+    parts = [p.strip() for p in label.split("/") if p.strip()]
+    if len(parts) != 2:
+        return [item]
+    out = []
+    for part in parts:
+        new_item = json.loads(json.dumps(item))  # deep copy
+        new_item["element"] = part
+        new_fix = new_item.get("auto_fix") or {}
+        new_fix["message_label"] = part
+        new_item["auto_fix"] = new_fix
+        out.append(new_item)
+    return out
+
+
+def _sequence_sanitize_item(item: Dict) -> List[Dict]:
+    """Apply all sequence-only safety-net fixes to one normalized LLM error item."""
+    et = item.get("error_type", "")
+    fix = item.get("auto_fix") or {}
+
+    if fix.get("fixable") and fix.get("arrow_type"):
+        fix["arrow_type"] = _sequence_fix_arrow_type(
+            et, item.get("description", ""), item.get("suggestion", ""), fix["arrow_type"])
+
+    if fix.get("fixable") and fix.get("from_element") and fix.get("to_element") and \
+       ("return" in et.lower() or "message" in et.lower()):
+        new_from, new_to = _sequence_fix_direction(
+            item.get("description", ""), fix["from_element"], fix["to_element"])
+        fix["from_element"], fix["to_element"] = new_from, new_to
+
+    item["auto_fix"] = fix
+
+    forced_sev = _SEQUENCE_SEVERITY_MAP.get(_n(et))
+    if forced_sev:
+        item["severity"] = forced_sev
+
+    return _split_merged_sequence_label(item)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2120,9 +2494,16 @@ def validate_with_openai(
                 "suggestion":  str(e.get("suggestion", "")),
                 "auto_fix":    auto_fix,
             }
-            if sev == "WARNING": llm_w.append(item)
-            elif sev == "INFO":  llm_i.append(item)
-            else:                llm_e.append(item)
+
+            items = [item]
+            if "sequence" in diagram_type.lower():
+                items = _sequence_sanitize_item(item)
+
+            for it in items:
+                s = it["severity"]
+                if s == "WARNING": llm_w.append(it)
+                elif s == "INFO":  llm_i.append(it)
+                else:              llm_e.append(it)
 
         # Step 4 — Merge: rule errors + filtered LLM errors
         return _merge_results(
@@ -2214,22 +2595,39 @@ CASE-INSENSITIVE: "Login" and "login" are the same — do NOT flag capitalisatio
 7. UNLABELLED_OBJECT — Object box has no label (say "object" not "lifeline").
 8. MISSING_DELETION_SYMBOL — Lifeline has no X/destroy marker. Only report if X symbols are genuinely absent.
 9. UNLABELLED_ARROW — Message arrow has no label.
-10. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element."""
+10. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow.
+11. MISSING_ALT_FRAGMENT — Conditional logic in scenario not shown as alt/opt fragment.
+12. MISSING_ACTIVATION — Lifeline that receives messages has no activation bar.
+13. SPELLING_MISTAKE — A lifeline/object/actor name closely resembles a scenario name but is misspelled. ONE error only — do NOT also report MISSING_LIFELINE or EXTRA_LIFELINE for the same element."""
         dtype_label = "SEQUENCE"
         extra_rules = """
-## SELF-MESSAGE RULE:
-- Self-message arrows (looping back to same lifeline) are VALID UML — do NOT report them as errors.
+## RETURN MESSAGE RULES — CRITICAL:
+- Return/response messages MUST use dashed arrows.
+- Solid arrows are for request/call messages ONLY.
+- Each request has its OWN separate return arrow — never merge multiple returns.
+- Return arrow direction = from receiver back to sender (reverse of request).
 
-## DELETION SYMBOL RULE:
-- If you SEE any X marks at lifeline ends → deletion symbols ARE present. Do NOT report them missing.
+## ALT FRAGMENT RULES:
+- If scenario has conditions/alternatives (if/else), there MUST be alt fragment boxes.
+- Missing alt fragment → report MISSING_ALT_FRAGMENT as ERROR.
+
+## ACTIVATION BAR RULES:
+- Any lifeline that receives a message MUST have activation box.
+- Missing activation → report MISSING_ACTIVATION as WARNING.
+
+## DELETION SYMBOL RULES:
+- If you SEE any X marks at lifeline ends → deletion symbols ARE present.
 - Only report MISSING_DELETION_SYMBOL for lifelines with genuinely no X at the bottom.
 
 ## OBJECT vs LIFELINE:
-- An object box (rectangle with name) IS a named participant. Do NOT report it as unnamed.
+- An object box (rectangle with name) IS a named participant.
 - If the object is truly empty/unlabelled → say "Object has no name", not "lifeline has no name".
 
 ## MESSAGE ORDER:
-- Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP."""
+- Only report WRONG_MESSAGE_ORDER if you are 100% certain. When in doubt → SKIP.
+
+## WRONG_ARROW_TYPE:
+- If a return/response message uses solid arrow → report WRONG_ARROW_TYPE as ERROR."""
 
     else:
         rules = """1. MISSING_CLASS              — Important nouns in scenario must be classes. Only explicitly named entities.
@@ -2355,6 +2753,9 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - MISSING_VERB_IN_USE_CASE → action: "rename_shape", name: <corrected name with verb + noun only>, fixable: true
 - WRONG_ASSOCIATION_LABEL → action: "add_label", from_element, to_element, label: <correct label from scenario>, fixable: true
 - WRONG_ACTOR_NAME → fixable: false
+- WRONG_ARROW_TYPE → action: "change_arrow_type", arrow_type: "dashed_arrow", from_element, to_element, fixable: true
+- MISSING_ALT_FRAGMENT → action: "add_shape", shape_type: "combined_fragment", name: "alt", fixable: true
+- MISSING_ACTIVATION → action: "add_shape", shape_type: "activation_box", name: <lifeline name>, fixable: true
 All other errors → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
