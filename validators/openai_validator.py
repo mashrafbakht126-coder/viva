@@ -76,7 +76,7 @@ _TOOLTYPE_MAP = {
     "composition":          "composition_arrow",
     "dependency":           "dependency_arrow",
     "dashedarrow":          "dashed_arrow",
-    "dashedopenarow":       "dashed_open_arrow",
+    "dashedopenarrow":      "dashed_open_arrow",
     "dottedarrow":          "dotted_arrow",
     "excludearrow":         "include_extend_arrow",
     "arrow":                "arrow",
@@ -124,10 +124,21 @@ _USECASE_VALID_TYPES = {
 _SEQUENCE_VALID_TYPES = {
     "lifeline", "object_lifeline", "actor", "activation_box",
     "deletion_marker", "combined_fragment",
-    "arrow", "dashed_arrow", "dotted_arrow",
+    "arrow", "dashed_arrow", "dotted_arrow", "dashed_open_arrow",
     "self_message_arrow", "self_message_dotted_arrow",
     "line", "text_label",
 }
+
+# All shape types that represent a "message" arrow in a sequence diagram.
+# 'dashed_open_arrow' is the real type the app sends for reply/return
+# messages (confirmed from an actual request payload) — it was missing from
+# every check below before, which silently excluded every return message
+# (e.g. 'insufficient balance', 'cash dispensed') from activation, deletion,
+# and fragment-content checks.
+_SEQ_MESSAGE_TYPES = (
+    "arrow", "dashed_arrow", "dotted_arrow", "dashed_open_arrow",
+    "self_message_arrow", "self_message_dotted_arrow",
+)
 
 _VALID_TYPES_BY_DIAGRAM = {
     "class":    _CLASS_VALID_TYPES,
@@ -135,12 +146,36 @@ _VALID_TYPES_BY_DIAGRAM = {
     "sequence": _SEQUENCE_VALID_TYPES,
 }
 
+# Union of every diagram type's valid clean names, plus other known clean
+# names that appear as _TOOLTYPE_MAP values but aren't in a valid-types set
+# (e.g. 'circle'). Used by _clean_type to recognize a type string that's
+# ALREADY clean (as the app sometimes sends directly) before the
+# underscore-stripping lookup step, which would otherwise mangle it.
+_ALL_CLEAN_TYPES = (
+    _CLASS_VALID_TYPES | _USECASE_VALID_TYPES | _SEQUENCE_VALID_TYPES
+    | set(_TOOLTYPE_MAP.values()) | {"circle"}
+)
+
 
 def _clean_type(raw_type: str) -> str:
-    """Strip 'ToolType.' prefix and return a readable name."""
+    """Strip 'ToolType.' prefix and return a readable name.
+
+    Handles two possible inputs generically (not tied to any one scenario):
+      1. A raw Flutter ToolType string, e.g. 'ToolType.object' — looked up
+         in _TOOLTYPE_MAP after stripping separators.
+      2. An already-clean type string the app sometimes sends directly,
+         e.g. 'object_lifeline', 'activation_box', 'deletion_marker',
+         'dashed_open_arrow' — returned as-is. This case MUST be checked
+         BEFORE stripping underscores, because stripping first turns
+         'object_lifeline' into 'objectlifeline', which matches nothing in
+         _TOOLTYPE_MAP (whose keys are stripped RAW ToolType names) and
+         previously caused the shape to be silently dropped.
+    """
     t = str(raw_type).strip().lower()
     if "." in t:
         t = t.split(".")[-1]            # 'ToolType.classFullShape' → 'classfullshape'
+    if t in _ALL_CLEAN_TYPES:
+        return t                        # already a recognized clean type name
     t = re.sub(r"[_\-]", "", t)        # drop separators before lookup
     if t in _TOOLTYPE_MAP:
         return _TOOLTYPE_MAP[t]
@@ -1206,6 +1241,36 @@ def _seq_label_seems_truncated(label: str, scenario: str) -> Optional[str]:
     return None
 
 
+_SEQ_DANGLING_LAST_WORDS = {
+    "with", "and", "or", "to", "for", "of", "in", "on", "at",
+    "the", "a", "an", "from", "by", "as", "&",
+}
+
+
+def _seq_label_looks_incomplete_standalone(label: str) -> bool:
+    """
+    Scenario-independent check for a truncated label. Two safe signals:
+      1. A single bare word with trailing whitespace (e.g. 'request ') —
+         a real one-word label rarely has an accidental trailing space,
+         whereas a label still being typed when the user was interrupted
+         does. Restricted to single-word labels so a genuinely complete
+         multi-word phrase with an accidental trailing space (e.g.
+         'insufficient balance ') is never wrongly flagged.
+      2. The label's last word is a preposition/connector that virtually
+         always needs a following word (e.g. 'request with', 'insert card
+         and'), regardless of trailing whitespace.
+    """
+    if not label:
+        return False
+    stripped = label.rstrip()
+    words = re.findall(r"[a-zA-Z']+", stripped.lower())
+    if not words:
+        return False
+    if label != stripped and len(words) == 1:
+        return True
+    return words[-1] in _SEQ_DANGLING_LAST_WORDS
+
+
 def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for sequence diagrams."""
     errors = []
@@ -1247,6 +1312,50 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         else:
             lifelines[n] = name
 
+    # ── Lifeline x-positions + geometric endpoint resolver ─────────────────────
+    # Built early so every check below can use it. Confirmed from a real
+    # request payload: the app's own from/to resolution sometimes leaves
+    # 'from'/'to' (and startLifeline/endLifeline) BLANK on a real arrow that
+    # is clearly connected on-screen — e.g. a solid message arrow whose end
+    # point sits exactly under 'ATM System' still arrived with "to": "".
+    # Relying on the name string alone in that case silently drops that
+    # lifeline from activation/deletion/fragment participation counts. So
+    # every from/to lookup below falls back to matching the arrow's actual
+    # start/end x-coordinate to the nearest lifeline when the string is empty.
+    lifeline_x: Dict[str, float] = {}
+    for s in shapes:
+        if s.get("type") in ("lifeline", "object_lifeline", "actor"):
+            ln = _n(_shape_name(s))
+            pos = _geo_pos(s)
+            if ln and pos is not None:
+                w, _h = _geo_size(s)
+                lifeline_x[ln] = pos[0] + w / 2.0
+
+    def _seq_nearest_lifeline_by_x(x: float) -> Optional[str]:
+        if not lifeline_x:
+            return None
+        best_n, best_d = None, None
+        for ln, lx in lifeline_x.items():
+            d = abs(lx - x)
+            if best_d is None or d < best_d:
+                best_d, best_n = d, ln
+        return best_n if best_d is not None and best_d <= 250 else None
+
+    def _seq_endpoint(s: Dict, side: str) -> str:
+        """Resolve an arrow's 'from' or 'to' lifeline name: prefer the
+        app-provided string field, fall back to geometry when it's blank."""
+        if side == "from":
+            v = str(s.get("from", "") or s.get("startLifeline", "") or "").strip()
+        else:
+            v = str(s.get("to", "") or s.get("endLifeline", "") or "").strip()
+        if v and _n(v) not in ("none", "null", "undefined"):
+            return v
+        pos = _geo_pos(s) if side == "from" else _geo_end_abs(s)
+        if pos is None:
+            return ""
+        matched = _seq_nearest_lifeline_by_x(pos[0])
+        return lifelines.get(matched, "") if matched else ""
+
     # ── Spelling mistake check: lifeline/actor/object name vs scenario wording ──
     # Deterministic net so a typo'd participant name (e.g. 'custmer' when the
     # scenario says 'customer') is always caught, instead of relying on the
@@ -1275,10 +1384,10 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     # ── Check for unlabelled arrows ──
     arrow_count = 0
     for s in shapes:
-        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow", 
-                             "self_message_arrow", "self_message_dotted_arrow"):
+        if s.get("type") in _SEQ_MESSAGE_TYPES:
             arrow_count += 1
-            label = str(s.get("label") or s.get("text") or "").strip()
+            raw_label = str(s.get("label") or s.get("text") or "")
+            label = raw_label.strip()
             if _n(label) in ("", "none", "null", "undefined"):
                 errors.append({
                     "error_type": "UNLABELLED_ARROW", "severity": "WARNING",
@@ -1287,24 +1396,47 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                     "suggestion": "Add a message name to this arrow.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
                 })
-            elif scenario:
-                # ── Incomplete/truncated message label check ──
-                # Catches labels cut short on the diagram, e.g. 'request with'
-                # when the scenario says 'request withdrawal', or 'insert
-                # card' when the scenario says 'insert card and pin'.
+                continue
+
+            # ── Incomplete/truncated message label check ──
+            # 1) Scenario-independent: a trailing space (checked on the RAW,
+            #    unstripped label — stripping first would erase the very
+            #    signal being looked for), or the label's last word being a
+            #    dangling preposition/connector ('with', 'and', 'to' ...),
+            #    is an objective sign of a cut-off label — this fires even
+            #    when the scenario's wording doesn't literally match the
+            #    diagram (e.g. scenario says 'withdraw money' but the arrow
+            #    just says 'request ').
+            standalone_issue = _seq_label_looks_incomplete_standalone(raw_label)
+            fuller = None
+            if scenario:
+                # 2) Scenario-based: catches labels cut short compared to the
+                #    scenario's own wording, e.g. 'request with' when the
+                #    scenario says 'request withdrawal'.
                 fuller = _seq_label_seems_truncated(label, scenario)
-                if fuller and _n(fuller) != _n(label):
-                    frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
-                    to  = str(s.get("to", "") or s.get("endLifeline", "") or "")
-                    errors.append({
-                        "error_type": "INCOMPLETE_MESSAGE_LABEL",
-                        "severity": "WARNING",
-                        "element": label,
-                        "description": f"Message label '{label}' looks incomplete/truncated. The scenario describes it as '{fuller}'.",
-                        "suggestion": f"Update the arrow label to '{fuller}' to match the scenario.",
-                        "auto_fix": {"fixable": True, "action": "rename_shape",
-                                     "name": fuller, "from_element": frm, "to_element": to},
-                    })
+                if fuller and _n(fuller) == _n(label):
+                    fuller = None
+
+            if standalone_issue or fuller:
+                frm = _seq_endpoint(s, "from")
+                to = _seq_endpoint(s, "to")
+                if fuller:
+                    desc = f"Message label '{label}' looks incomplete/truncated. The scenario describes it as '{fuller}'."
+                    suggestion = f"Update the arrow label to '{fuller}' to match the scenario."
+                    fix_name = fuller
+                else:
+                    desc = f"Message label '{label}' looks incomplete/truncated (it trails off without finishing the phrase)."
+                    suggestion = f"Finish the message label — '{label.strip()}' looks cut short."
+                    fix_name = label.strip()
+                errors.append({
+                    "error_type": "INCOMPLETE_MESSAGE_LABEL",
+                    "severity": "WARNING",
+                    "element": label,
+                    "description": desc,
+                    "suggestion": suggestion,
+                    "auto_fix": {"fixable": True, "action": "rename_shape",
+                                 "name": fix_name, "from_element": frm, "to_element": to},
+                })
 
     # ── FIX 1: Check return arrow types (WRONG_ARROW_TYPE) ──
     for s in shapes:
@@ -1316,8 +1448,8 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         
         # If it's a return message and uses solid arrow (type "arrow") → WRONG_ARROW_TYPE
         if is_return and s.get("type") == "arrow":
-            frm = str(s.get("from", "") or s.get("startLifeline", "") or "")
-            to = str(s.get("to", "") or s.get("endLifeline", "") or "")
+            frm = _seq_endpoint(s, "from")
+            to = _seq_endpoint(s, "to")
             errors.append({
                 "error_type": "WRONG_ARROW_TYPE",
                 "severity": "ERROR",
@@ -1333,10 +1465,10 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     # Collect lifelines that receive messages
     receivers = set()
     for s in shapes:
-        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow"):
-            to = str(s.get("to", "") or s.get("endLifeline", "") or "")
+        if s.get("type") in _SEQ_MESSAGE_TYPES:
+            to = _n(_seq_endpoint(s, "to"))
             if to:
-                receivers.add(_n(to))
+                receivers.add(to)
     
     # Collect lifelines that have activation bars
     activations = set()
@@ -1361,34 +1493,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             })
 
     # ── FIX 3: Check for deletion symbols ──
-    # Build lifeline x-centers so a deletion marker can be matched to the
-    # lifeline it visually sits under, in ADDITION to its name/ref field.
-    # A marker's 'lifeline'/'on'/'name' ref is not always reliable (e.g. it
-    # can be blank or point at the wrong id), which previously caused a
-    # marker that IS present on the diagram to be reported as missing on
-    # the wrong lifeline, while a lifeline truly missing its marker was
-    # never checked at all. Geometry is used as the primary signal when
-    # available, since a deletion marker's on-screen position under a
-    # lifeline is unambiguous; the name ref is kept as a fallback.
-    lifeline_x: Dict[str, float] = {}
-    for s in shapes:
-        if s.get("type") in ("lifeline", "object_lifeline", "actor"):
-            ln = _n(_shape_name(s))
-            pos = _geo_pos(s)
-            if ln and pos is not None:
-                w, _h = _geo_size(s)
-                lifeline_x[ln] = pos[0] + w / 2.0
-
-    def _seq_nearest_lifeline_by_x(x: float) -> Optional[str]:
-        if not lifeline_x:
-            return None
-        best_n, best_d = None, None
-        for ln, lx in lifeline_x.items():
-            d = abs(lx - x)
-            if best_d is None or d < best_d:
-                best_d, best_n = d, ln
-        return best_n if best_d is not None and best_d <= 250 else None
-
+    # (lifeline_x / _seq_nearest_lifeline_by_x already built above)
     # Collect lifelines that have deletion markers
     deletions = set()
     for s in shapes:
@@ -1411,13 +1516,14 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     # only OUTGOING messages counted, which meant a lifeline that mostly
     # RECEIVES (e.g. a system that sends only one reply back) never reached
     # the threshold and was skipped entirely, even though it visibly had no
-    # marker on the diagram.
+    # marker on the diagram. Also uses the geometric endpoint resolver, since
+    # the app's own from/to strings can come back blank on a real, visibly-
+    # connected arrow.
     msg_total: Dict[str, int] = {}
     for s in shapes:
-        if s.get("type") in ("arrow", "dashed_arrow", "dotted_arrow",
-                              "self_message_arrow", "self_message_dotted_arrow"):
-            frm = _n(str(s.get("from", "") or s.get("startLifeline", "") or ""))
-            to  = _n(str(s.get("to", "") or s.get("endLifeline", "") or ""))
+        if s.get("type") in _SEQ_MESSAGE_TYPES:
+            frm = _n(_seq_endpoint(s, "from"))
+            to  = _n(_seq_endpoint(s, "to"))
             if frm:
                 msg_total[frm] = msg_total.get(frm, 0) + 1
             if to:
@@ -1502,16 +1608,15 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
 
         msgs = []
         for s in shapes:
-            if s.get("type") not in ("arrow", "dashed_arrow", "dotted_arrow",
-                                      "self_message_arrow", "self_message_dotted_arrow"):
+            if s.get("type") not in _SEQ_MESSAGE_TYPES:
                 continue
             pos = _geo_pos(s)
             if pos is None or not (region_top <= pos[1] <= region_bottom):
                 continue
             msgs.append({
                 "y": pos[1],
-                "from": str(s.get("from", "") or s.get("startLifeline", "") or ""),
-                "to": str(s.get("to", "") or s.get("endLifeline", "") or ""),
+                "from": _seq_endpoint(s, "from"),
+                "to": _seq_endpoint(s, "to"),
                 "type": s.get("type"),
             })
 
@@ -2628,7 +2733,7 @@ def make_error_fingerprint(error_type: str, element: str = "",
 # ─────────────────────────────────────────────────────────────────────────────
 
 _SEQUENCE_VALID_ARROW_TYPES = {
-    "arrow", "dashed_arrow", "dotted_arrow",
+    "arrow", "dashed_arrow", "dotted_arrow", "dashed_open_arrow",
     "self_message_arrow", "self_message_dotted_arrow",
 }
 
