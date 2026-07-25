@@ -1478,13 +1478,25 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         else:
             guard1 = parts[1].strip() if len(parts) > 1 else ""
         guard2 = "\n".join(parts[sep_idx + 1:]).strip() if sep_idx >= 0 and sep_idx + 1 < len(parts) else ""
+        if not guard1 and not guard2:
+            continue
 
-        divider_y = fy1 + (fy2 - fy1) * 0.5
+        box_h = max(fy2 - fy1, 1.0)
+        divider_y = fy1 + box_h * 0.5
+        # Generous tolerance: the fragment's stored size can lag behind a
+        # manual resize done in the editor (e.g. after arrows are added
+        # lower down), so messages are matched against a wide margin
+        # around the box rather than a hard cut exactly at its edges.
+        margin_top = max(40.0, box_h * 0.15)
+        margin_bottom = max(200.0, box_h * 1.0)
+        region_top = fy1 - margin_top
+        region_bottom = fy2 + margin_bottom
+
         operands = []
         if guard1:
-            operands.append((fy1, divider_y, guard1))
+            operands.append((region_top, divider_y, guard1))
         if guard2:
-            operands.append((divider_y, fy2, guard2))
+            operands.append((divider_y, region_bottom, guard2))
         if not operands:
             continue
 
@@ -1494,7 +1506,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                                       "self_message_arrow", "self_message_dotted_arrow"):
                 continue
             pos = _geo_pos(s)
-            if pos is None or not (fy1 <= pos[1] <= fy2):
+            if pos is None or not (region_top <= pos[1] <= region_bottom):
                 continue
             msgs.append({
                 "y": pos[1],
@@ -1502,7 +1514,15 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "to": str(s.get("to", "") or s.get("endLifeline", "") or ""),
                 "type": s.get("type"),
             })
-        template = msgs[0] if msgs else None
+
+        # Safety net: if the geometry doesn't line up with ANY message near
+        # this fragment at all (e.g. a stale/lagging stored box size), we
+        # can't trust the bucketing for this diagram — stay silent instead
+        # of risking a false positive on every operand. Only proceed once
+        # we've actually found real messages to reason about.
+        if not msgs:
+            continue
+        template = msgs[0]
 
         for lower, upper, gtext in operands:
             count_in_operand = sum(1 for m in msgs if lower <= m["y"] < upper)
