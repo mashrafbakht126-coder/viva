@@ -1387,7 +1387,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             d = abs(lx - x)
             if best_d is None or d < best_d:
                 best_d, best_n = d, ln
-        return best_n if best_d is not None and best_d <= 120 else None
+        return best_n if best_d is not None and best_d <= 250 else None
 
     # Collect lifelines that have deletion markers
     deletions = set()
@@ -1454,34 +1454,39 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     fragment_shapes = [s for s in shapes if _is_fragment_shape(s)]
     has_fragment = bool(fragment_shapes)
 
-    # ── FIX 5: Missing message inside an alt/opt operand ──────────────────────
-    # Catches the case where an operand's guard condition (e.g.
-    # '[sufficient balance]') is drawn but the message arrow that belongs
-    # inside it was left out (e.g. the 'cash dispensed' return arrow),
-    # leaving that operand visually empty. Purely geometric — only runs
-    # when position/size data is present, so it never guesses when there's
-    # no reliable layout to check against.
-    _guard_re = re.compile(r"^\s*\[(.+?)\]\s*$")
+    # ── FIX 5: Missing message inside an alt operand ───────────────────────────
+    # The app stores an alt fragment's two guard conditions INSIDE the
+    # fragment shape's own 'text' field as 'alt\n<guard1>\n---\n<guard2>'
+    # (see the fragment edit dialog / painter — guard1 is drawn in the top
+    # half, guard2 in the bottom half, split by a divider at exactly 50% of
+    # the fragment's height). This catches the case where a guard condition
+    # is filled in (e.g. '[sufficient balance]') but the message arrow that
+    # belongs inside that half was left out (e.g. the 'cash dispensed'
+    # return arrow), leaving that half visually empty. Purely geometric —
+    # only runs when position/size data is present.
     for frag in fragment_shapes:
         fbbox = _geo_bbox(frag)
         if fbbox is None:
             continue
         fx1, fy1, fx2, fy2 = fbbox
 
-        guards = []
-        for s in shapes:
-            if s is frag:
-                continue
-            m = _guard_re.match(_shape_name(s))
-            if not m:
-                continue
-            pos = _geo_pos(s)
-            if pos is None or not (fy1 - 20 <= pos[1] <= fy2 + 20):
-                continue
-            guards.append((pos[1], m.group(1).strip()))
-        if len(guards) < 2:
-            continue  # need at least 2 operands to reason about which is empty
-        guards.sort(key=lambda g: g[0])
+        raw_text = _shape_name(frag)
+        parts = raw_text.split("\n")
+        sep_idx = parts.index("---") if "---" in parts else -1
+        if sep_idx > 0:
+            guard1 = "\n".join(parts[1:sep_idx]).strip()
+        else:
+            guard1 = parts[1].strip() if len(parts) > 1 else ""
+        guard2 = "\n".join(parts[sep_idx + 1:]).strip() if sep_idx >= 0 and sep_idx + 1 < len(parts) else ""
+
+        divider_y = fy1 + (fy2 - fy1) * 0.5
+        operands = []
+        if guard1:
+            operands.append((fy1, divider_y, guard1))
+        if guard2:
+            operands.append((divider_y, fy2, guard2))
+        if not operands:
+            continue
 
         msgs = []
         for s in shapes:
@@ -1499,9 +1504,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             })
         template = msgs[0] if msgs else None
 
-        bounds = [g[0] for g in guards] + [fy2]
-        for idx, (gy, gtext) in enumerate(guards):
-            lower, upper = gy, bounds[idx + 1]
+        for lower, upper, gtext in operands:
             count_in_operand = sum(1 for m in msgs if lower <= m["y"] < upper)
             if count_in_operand == 0:
                 auto_fix = {"fixable": False}
@@ -1516,9 +1519,9 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 errors.append({
                     "error_type": "MISSING_MESSAGE_IN_FRAGMENT",
                     "severity": "ERROR",
-                    "element": f"[{gtext}]",
-                    "description": f"The alt/opt operand '[{gtext}]' has no message arrow inside it.",
-                    "suggestion": f"Add the expected message/response arrow inside the '[{gtext}]' operand.",
+                    "element": gtext,
+                    "description": f"The alt operand '{gtext}' has no message arrow inside it.",
+                    "suggestion": f"Add the expected message/response arrow inside the '{gtext}' operand.",
                     "auto_fix": auto_fix,
                 })
 
