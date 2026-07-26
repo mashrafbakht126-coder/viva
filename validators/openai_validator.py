@@ -1404,7 +1404,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     lifelines = {}
 
     # ── Collect lifelines ──
-    for s in shapes:
+    for idx, s in enumerate(shapes):
         t = s.get("type", "")
         if t not in ("lifeline", "object_lifeline", "actor"):
             continue
@@ -1428,6 +1428,13 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     "suggestion": "Give this lifeline a meaningful name.",
                     "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
                 })
+            # Still track this lifeline under a synthetic key (position-based,
+            # since it has no name) so activation-bar / deletion-marker checks
+            # further down still evaluate it instead of silently skipping it
+            # until the person happens to name it.
+            pos = _geo_pos(s)
+            synth_key = f"__unnamed_{idx}_{pos[0] if pos else 0}_{pos[1] if pos else 0}__"
+            lifelines[synth_key] = "(unnamed lifeline)" if t != "object_lifeline" and t != "object" else "(unnamed object)"
         elif n in lifelines:
             errors.append({
                 "error_type": "DUPLICATE_LIFELINE", "severity": "WARNING",
@@ -1450,10 +1457,12 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     # every from/to lookup below falls back to matching the arrow's actual
     # start/end x-coordinate to the nearest lifeline when the string is empty.
     lifeline_x: Dict[str, float] = {}
-    for s in shapes:
+    for idx, s in enumerate(shapes):
         if s.get("type") in ("lifeline", "object_lifeline", "actor"):
             ln = _n(_shape_name(s))
             pos = _geo_pos(s)
+            if not ln and pos is not None:
+                ln = f"__unnamed_{idx}_{pos[0]}_{pos[1]}__"
             if ln and pos is not None:
                 w, _h = _geo_size(s)
                 lifeline_x[ln] = pos[0] + w / 2.0
@@ -1482,6 +1491,24 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
             return ""
         matched = _seq_nearest_lifeline_by_x(pos[0])
         return lifelines.get(matched, "") if matched else ""
+
+    def _seq_endpoint_key(s: Dict, side: str) -> str:
+        """Like _seq_endpoint, but returns the 'lifelines' dict KEY (not the
+        display name) — used for internal membership checks (receivers,
+        msg_total) so an UNNAMED lifeline (keyed by a synthetic
+        position-based id, not by its placeholder display text) is still
+        correctly matched instead of silently falling through."""
+        if side == "from":
+            v = str(s.get("from", "") or s.get("startLifeline", "") or "").strip()
+        else:
+            v = str(s.get("to", "") or s.get("endLifeline", "") or "").strip()
+        if v and _n(v) not in ("none", "null", "undefined"):
+            vn = _n(v)
+            return vn if vn in lifelines else vn
+        pos = _geo_pos(s) if side == "from" else _geo_end_abs(s)
+        if pos is None:
+            return ""
+        return _seq_nearest_lifeline_by_x(pos[0]) or ""
 
     # ── Spelling mistake check: lifeline/actor/object name vs scenario wording ──
     # Deterministic net so a typo'd participant name (e.g. 'custmer' when the
@@ -1622,7 +1649,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     receivers = set()
     for s in shapes:
         if s.get("type") in _SEQ_MESSAGE_TYPES:
-            to = _n(_seq_endpoint(s, "to"))
+            to = _seq_endpoint_key(s, "to")
             if to:
                 receivers.add(to)
     
@@ -1678,8 +1705,8 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     msg_total: Dict[str, int] = {}
     for s in shapes:
         if s.get("type") in _SEQ_MESSAGE_TYPES:
-            frm = _n(_seq_endpoint(s, "from"))
-            to  = _n(_seq_endpoint(s, "to"))
+            frm = _seq_endpoint_key(s, "from")
+            to  = _seq_endpoint_key(s, "to")
             if frm:
                 msg_total[frm] = msg_total.get(frm, 0) + 1
             if to:
