@@ -1411,22 +1411,35 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
         name = _shape_name(s)
         n    = _n(name)
         if not n:
+            pos = _geo_pos(s)
+            pos_dict = {"dx": pos[0], "dy": pos[1]} if pos else None
+            # Identify WHICH unnamed shape this is (by position) so multiple
+            # unnamed objects/lifelines on the same diagram aren't reported
+            # as identical, indistinguishable errors.
+            location = f" at position {int(pos[0])},{int(pos[1])}" if pos else f" #{idx + 1}"
             # FIX: Use correct terminology for object vs lifeline
             if t == "object_lifeline" or t == "object":
                 errors.append({
                     "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
-                    "element": "(unnamed object)",
-                    "description": "An object lifeline has no name.",
+                    "element": f"(unnamed object{location})",
+                    "description": f"An object lifeline{location} has no name.",
                     "suggestion": "Give this object a meaningful name.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Object"},
+                    # 'label_lifeline' (not 'rename_shape'): rename_shape finds
+                    # its target by matching EXISTING text, which is blank
+                    # here and can never match — position identifies the
+                    # specific shape instead. Needs a small Dart addition
+                    # (see accompanying notes), same pattern as 'label_arrow'.
+                    "auto_fix": {"fixable": True, "action": "label_lifeline",
+                                 "name": "Object", "position": pos_dict},
                 })
             else:
                 errors.append({
                     "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
-                    "element": "(unnamed lifeline)",
-                    "description": "A lifeline has no name.",
+                    "element": f"(unnamed lifeline{location})",
+                    "description": f"A lifeline{location} has no name.",
                     "suggestion": "Give this lifeline a meaningful name.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
+                    "auto_fix": {"fixable": True, "action": "label_lifeline",
+                                 "name": "Participant", "position": pos_dict},
                 })
             # Still track this lifeline under a synthetic key (position-based,
             # since it has no name) so activation-bar / deletion-marker checks
