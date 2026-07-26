@@ -1157,6 +1157,18 @@ _SEQ_COMPOUND_CONNECTORS = {"and", "&", "or", "then"}
 
 _SEQ_GENERIC_LEADIN_WORDS = {"a", "an", "the", "this", "that", "draw", "create", "design"}
 
+# Words that mark a phrase as a message OUTCOME/STATUS/RESULT rather than a
+# participant name (e.g. 'Login Successful', 'Payment Failed', 'Order
+# Confirmed') — a scenario capitalizing these for emphasis is common, but
+# they should never be suggested as a lifeline/actor/object name.
+_SEQ_OUTCOME_WORDS = {
+    "successful", "success", "failed", "failure", "complete", "completed",
+    "confirmed", "approved", "denied", "rejected", "invalid", "valid",
+    "error", "exception", "granted", "found", "unavailable", "available",
+    "accepted", "declined", "cancelled", "canceled", "expired", "timeout",
+    "shown", "displayed", "sent", "received",
+}
+
 
 def _seq_extract_scenario_participants_fallback(scenario: str) -> List[str]:
     """
@@ -1170,18 +1182,30 @@ def _seq_extract_scenario_participants_fallback(scenario: str) -> List[str]:
     often is, e.g. 'the ATM system checks the balance'). Not tied to any one
     scenario's wording:
       1. Multi-word Capitalized phrases (e.g. 'ATM System', 'Payment
-         Gateway') — the usual way a scenario names a system/actor.
-      2. Common role nouns from the shared _COMMON_ROLE_NOUNS list
+         Gateway') — the usual way a scenario names a system/actor —
+         excluding ones that read as a message outcome/status instead
+         (e.g. 'Login Successful').
+      2. Standalone capitalized single words (e.g. 'Database', 'Server')
+         that appear at least once in a NON-sentence-initial position, so
+         an ordinary word merely capitalized for starting a sentence isn't
+         mistaken for a proper-noun participant name.
+      3. Common role nouns from the shared _COMMON_ROLE_NOUNS list
          (customer, user, admin, ...), including simple plural forms.
     """
     if not scenario:
         return []
     candidates: Set[str] = set()
 
+    def _is_outcome_phrase(phrase: str) -> bool:
+        return any(w.lower() in _SEQ_OUTCOME_WORDS for w in phrase.split())
+
     for m in re.finditer(r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\b", scenario):
         phrase = m.group(1).strip()
-        if phrase.split()[0].lower() not in _SEQ_GENERIC_LEADIN_WORDS:
-            candidates.add(phrase)
+        if phrase.split()[0].lower() in _SEQ_GENERIC_LEADIN_WORDS:
+            continue
+        if _is_outcome_phrase(phrase):
+            continue
+        candidates.add(phrase)
 
     words = re.findall(r"[a-zA-Z]+", scenario.lower())
     for w in words:
@@ -1402,6 +1426,8 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     """Deterministic rule checks for sequence diagrams."""
     errors = []
     lifelines = {}
+    unnamed_shape_errors = []  # (error_dict, shape_type) — reconciled with
+                               # MISSING_LIFELINE candidates at the end.
 
     # ── Collect lifelines ──
     for idx, s in enumerate(shapes):
@@ -1419,7 +1445,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
             location = f" at position {int(pos[0])},{int(pos[1])}" if pos else f" #{idx + 1}"
             # FIX: Use correct terminology for object vs lifeline
             if t == "object_lifeline" or t == "object":
-                errors.append({
+                _u_err = {
                     "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
                     "element": f"(unnamed object{location})",
                     "description": f"An object lifeline{location} has no name.",
@@ -1431,16 +1457,20 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     # (see accompanying notes), same pattern as 'label_arrow'.
                     "auto_fix": {"fixable": True, "action": "label_lifeline",
                                  "name": "Object", "position": pos_dict},
-                })
+                }
+                errors.append(_u_err)
+                unnamed_shape_errors.append((_u_err, t))
             else:
-                errors.append({
+                _u_err = {
                     "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
                     "element": f"(unnamed lifeline{location})",
                     "description": f"A lifeline{location} has no name.",
                     "suggestion": "Give this lifeline a meaningful name.",
                     "auto_fix": {"fixable": True, "action": "label_lifeline",
                                  "name": "Participant", "position": pos_dict},
-                })
+                }
+                errors.append(_u_err)
+                unnamed_shape_errors.append((_u_err, t))
             # Still track this lifeline under a synthetic key (position-based,
             # since it has no name) so activation-bar / deletion-marker checks
             # further down still evaluate it instead of silently skipping it
@@ -2012,6 +2042,39 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     "suggestion": f"Add a message arrow labelled something like '{verb}' between the relevant participants.",
                     "auto_fix": {"fixable": False},
                 })
+
+    # ── Reconcile unnamed shapes with scenario-derived missing-participant
+    # candidates ─────────────────────────────────────────────────────────
+    # An unnamed lifeline/object/actor and a "scenario mentions X but no
+    # matching lifeline exists" finding are very often the SAME underlying
+    # issue — the person drew the shape but never typed its name. Instead of
+    # reporting both separately (and suggesting a generic placeholder name),
+    # pair them up: an unnamed ACTOR gets a role-noun-style candidate
+    # (customer, user, admin, ...) since that's what actors are usually
+    # called; an unnamed OBJECT/LIFELINE gets a non-role (system-like, e.g.
+    # 'Server') candidate, since that's what systems/services are usually
+    # called. Only pairs when a like-for-like candidate is available —
+    # never guesses a candidate of the wrong kind onto a shape.
+    missing_lifeline_idxs = [i for i, e in enumerate(errors) if e["error_type"] == "MISSING_LIFELINE"]
+    role_candidate_idxs = [i for i in missing_lifeline_idxs if _n(errors[i]["element"]) in _COMMON_ROLE_NOUNS]
+    system_candidate_idxs = [i for i in missing_lifeline_idxs if i not in role_candidate_idxs]
+    consumed_idxs = set()
+
+    for u_err, u_type in unnamed_shape_errors:
+        pool = role_candidate_idxs if u_type == "actor" else system_candidate_idxs
+        pick = next((i for i in pool if i not in consumed_idxs), None)
+        if pick is None:
+            continue
+        consumed_idxs.add(pick)
+        cand_name = errors[pick]["element"]
+        u_err["description"] = (
+            f"{u_err['description']} The scenario suggests this should be '{cand_name}'."
+        )
+        u_err["suggestion"] = f"Name this {'actor' if u_type == 'actor' else 'object'} '{cand_name}', as described in the scenario."
+        u_err["auto_fix"]["name"] = cand_name
+
+    if consumed_idxs:
+        errors = [e for i, e in enumerate(errors) if i not in consumed_idxs]
 
     return errors
 
