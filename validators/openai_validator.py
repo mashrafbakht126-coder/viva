@@ -370,7 +370,7 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
         if from_el and to_el:
             return {"fixable": True, "action": "change_arrow_type",
                     "from_element": from_el, "to_element": to_el,
-                    "arrow_type": "dashed_arrow"}
+                    "arrow_type": "dashed_open_arrow"}
         return {"fixable": False}
 
     if "MISSING_LIFELINE" in et:
@@ -401,7 +401,7 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
             return {"fixable": True, "action": "add_arrow",
                     "from_element": from_el, "to_element": to_el,
                     "message_label": element or "return",
-                    "arrow_type": "dashed_arrow"}
+                    "arrow_type": "dashed_open_arrow"}
         # Try to parse from raw_error fields — again, no forced reversal
         frm = str(raw_error.get("from_element", ""))
         to = str(raw_error.get("to_element", ""))
@@ -409,7 +409,7 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
             return {"fixable": True, "action": "add_arrow",
                     "from_element": frm, "to_element": to,
                     "message_label": element or "return",
-                    "arrow_type": "dashed_arrow"}
+                    "arrow_type": "dashed_open_arrow"}
         return {"fixable": False}
 
     if "MISSING_MESSAGE" in et:
@@ -440,8 +440,8 @@ def _build_fallback_fix(error_type: str, element: str, raw_error: dict, diagram_
 
     # FIX 5: Missing deletion symbol
     if "MISSING_DELETION_SYMBOL" in et:
-        return {"fixable": True, "action": "add_shape", "shape_type": "deletion_marker",
-                "name": element}
+        return {"fixable": True, "action": "add_deletion_marker",
+                "name": element, "from_element": element}
 
     if "ISOLATED_LIFELINE" in et:
         return {"fixable": False}
@@ -1271,6 +1271,86 @@ def _seq_label_looks_incomplete_standalone(label: str) -> bool:
     return words[-1] in _SEQ_DANGLING_LAST_WORDS
 
 
+_SEQ_CHECK_VERBS = {
+    "checks", "check", "verifies", "verify", "validates", "validate",
+    "confirms", "confirm", "computes", "compute", "calculates", "calculate",
+    "processes", "process", "reads", "read", "updates", "update",
+    "authenticates", "authenticate", "retrieves", "retrieve",
+}
+_SEQ_LEADING_FILLER_WORDS = {
+    "the", "a", "an", "this", "that", "then", "and", "so", "it",
+    "system", "internally", "will", "first", "next", "now",
+}
+
+
+def _seq_clean_clause_to_label(clause: str) -> Optional[str]:
+    """
+    Turn a scenario clause like 'The ATM system internally checks the
+    account balance' into a short message label like 'check account
+    balance'. Looks for a recognizable check/verify-style verb and starts
+    the label there, singularizing the verb for a cleaner message name.
+    Returns None (rather than a guess) when no such verb is found, so
+    callers fall back to a generic placeholder instead of inventing text.
+    """
+    words = re.findall(r"[a-zA-Z']+", clause)
+    if not words:
+        return None
+    verb_idx = next((i for i, w in enumerate(words) if w.lower() in _SEQ_CHECK_VERBS), None)
+    if verb_idx is None:
+        return None
+    tail = words[verb_idx:verb_idx + 5]
+    if tail[0].lower().endswith("s") and len(tail[0]) > 3:
+        tail[0] = tail[0][:-1]
+    return " ".join(tail).strip().lower()
+
+
+def _seq_guess_label_from_scenario(scenario: str, is_self_message: bool = False) -> Optional[str]:
+    """
+    Best-effort, general guess for a message label from the scenario text —
+    not tied to any one scenario's wording. Currently only attempts this for
+    self-messages, since scenarios describing an internal/self-check action
+    commonly use a recognizable '(self message)' cue phrase right next to
+    the action being described (e.g. '...checks the account balance (self
+    message)'). Returns None when no such cue is found.
+    """
+    if not scenario or not is_self_message:
+        return None
+    m = re.search(r"([^.]*?)\(\s*self[\s\-]?message\s*\)", scenario, re.IGNORECASE)
+    if m:
+        label = _seq_clean_clause_to_label(m.group(1))
+        if label:
+            return label
+    return None
+
+
+def _seq_guess_fragment_message(guard_text: str, scenario: str) -> Optional[str]:
+    """
+    Best-effort, general guess for the message that belongs inside an
+    alt/opt operand, derived from the scenario's own description of that
+    branch — not tied to any one scenario's wording. Looks for the guard's
+    condition keywords in the scenario (e.g. guard '[sufficient balance]' ->
+    keywords 'sufficient balance'), then reads whatever follows a
+    '->'/'\u2192'/'then'/':' separator in that clause as the outcome for
+    that branch (e.g. '... sufficient -> Cash is dispensed' -> 'cash is
+    dispensed'). Returns None — never invents content — if the scenario
+    doesn't describe this branch in a recognizable way.
+    """
+    if not scenario:
+        return None
+    keywords = [w for w in re.findall(r"[a-zA-Z]+", guard_text.lower()) if w not in _SEQ_STOPWORDS]
+    if not keywords:
+        return None
+    for clause in re.split(r"(?<=[.!?])\s+", scenario):
+        low = clause.lower()
+        if all(kw in low for kw in keywords):
+            m = re.search(r"(?:->|\u2192|then|:)\s*(.+)$", clause, re.IGNORECASE)
+            if m:
+                outcome_words = re.findall(r"[a-zA-Z']+", m.group(1))
+                if outcome_words:
+                    return " ".join(outcome_words[:6]).strip().lower()
+    return None
+
+
 def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     """Deterministic rule checks for sequence diagrams."""
     errors = []
@@ -1389,12 +1469,27 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             raw_label = str(s.get("label") or s.get("text") or "")
             label = raw_label.strip()
             if _n(label) in ("", "none", "null", "undefined"):
+                frm = _seq_endpoint(s, "from")
+                to = _seq_endpoint(s, "to")
+                is_self_msg = s.get("type") in ("self_message_arrow", "self_message_dotted_arrow") \
+                    or (frm and to and _n(frm) == _n(to))
+                guessed = _seq_guess_label_from_scenario(scenario, is_self_message=is_self_msg) if scenario else None
                 errors.append({
                     "error_type": "UNLABELLED_ARROW", "severity": "WARNING",
                     "element": "(unlabelled arrow)",
                     "description": "A message arrow has no label.",
-                    "suggestion": "Add a message name to this arrow.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "message"},
+                    "suggestion": (f"Add a message name to this arrow — the scenario suggests '{guessed}'."
+                                   if guessed else "Add a message name to this arrow."),
+                    # 'name' is filled with a scenario-derived guess when
+                    # available. Uses 'label_arrow' (not 'rename_shape'):
+                    # rename_shape finds its target by matching EXISTING
+                    # text, which is blank for an unlabelled arrow and can
+                    # never match — from_element/to_element identify the
+                    # specific arrow instead. Needs a small Dart addition
+                    # (see accompanying notes) to be recognized.
+                    "auto_fix": {"fixable": True, "action": "label_arrow",
+                                 "name": guessed or "message",
+                                 "from_element": frm, "to_element": to},
                 })
                 continue
 
@@ -1421,21 +1516,29 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 frm = _seq_endpoint(s, "from")
                 to = _seq_endpoint(s, "to")
                 if fuller:
+                    # We know the exact fuller phrase from the scenario —
+                    # safe to offer a real, working auto-fix.
                     desc = f"Message label '{label}' looks incomplete/truncated. The scenario describes it as '{fuller}'."
                     suggestion = f"Update the arrow label to '{fuller}' to match the scenario."
-                    fix_name = fuller
+                    auto_fix = {"fixable": True, "action": "rename_shape",
+                                "name": fuller, "from_element": frm, "to_element": to}
                 else:
+                    # Standalone signal only, with nothing in the scenario to
+                    # derive the missing words from — we cannot know what the
+                    # completed label should say (e.g. 'request' what?), so
+                    # renaming it to itself would be a no-op that looks like
+                    # a broken 'Fix' button. Mark not-fixable instead; the app
+                    # already renders that as a disabled wand icon.
                     desc = f"Message label '{label}' looks incomplete/truncated (it trails off without finishing the phrase)."
-                    suggestion = f"Finish the message label — '{label.strip()}' looks cut short."
-                    fix_name = label.strip()
+                    suggestion = f"Finish the message label — '{label.strip()}' looks cut short. Please edit it manually."
+                    auto_fix = {"fixable": False}
                 errors.append({
                     "error_type": "INCOMPLETE_MESSAGE_LABEL",
                     "severity": "WARNING",
                     "element": label,
                     "description": desc,
                     "suggestion": suggestion,
-                    "auto_fix": {"fixable": True, "action": "rename_shape",
-                                 "name": fix_name, "from_element": frm, "to_element": to},
+                    "auto_fix": auto_fix,
                 })
 
     # ── FIX 1: Check return arrow types (WRONG_ARROW_TYPE) ──
@@ -1458,7 +1561,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                 "suggestion": f"Change the arrow from solid to dashed for the return message '{label}'.",
                 "auto_fix": {"fixable": True, "action": "change_arrow_type", 
                              "from_element": frm, "to_element": to,
-                             "arrow_type": "dashed_arrow"},
+                             "arrow_type": "dashed_open_arrow"},
             })
 
     # ── FIX 2: Check for activation bars ──
@@ -1533,14 +1636,21 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         if lifeline in deletions:
             continue
         if msg_total.get(lifeline, 0) >= 2:  # participates enough to likely "end"
+            lifeline_display = lifelines.get(lifeline, lifeline)
             errors.append({
                 "error_type": "MISSING_DELETION_SYMBOL",
                 "severity": "WARNING",
-                "element": lifelines.get(lifeline, lifeline),
-                "description": f"Lifeline '{lifelines.get(lifeline, lifeline)}' may need a deletion marker (X) at its end.",
-                "suggestion": f"Add a deletion marker (X) at the bottom of lifeline '{lifelines.get(lifeline, lifeline)}'.",
-                "auto_fix": {"fixable": True, "action": "add_shape", 
-                             "shape_type": "deletion_marker", "name": lifeline},
+                "element": lifeline_display,
+                "description": f"Lifeline '{lifeline_display}' may need a deletion marker (X) at its end.",
+                "suggestion": f"Add a deletion marker (X) at the bottom of lifeline '{lifeline_display}'.",
+                # Dedicated action (not generic add_shape): the app's fix-apply
+                # switch only recognizes add_shape's shape_type as 'deletion'
+                # (not 'deletion_marker'), which was silently falling through
+                # to its default case and creating a class shape instead.
+                # add_deletion_marker also auto-positions the X correctly
+                # under the named lifeline instead of a generic canvas spot.
+                "auto_fix": {"fixable": True, "action": "add_deletion_marker",
+                             "name": lifeline_display, "from_element": lifeline_display},
             })
 
     # ── FIX 4: Check for alt fragments (now actually implemented) ──────────────
@@ -1633,19 +1743,31 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             count_in_operand = sum(1 for m in msgs if lower <= m["y"] < upper)
             if count_in_operand == 0:
                 auto_fix = {"fixable": False}
+                guessed_msg = _seq_guess_fragment_message(gtext, scenario) if scenario else None
                 if template:
+                    # 'dashed_open_arrow' is the real type the app uses for
+                    # reply/return messages (confirmed from an actual saved
+                    # diagram) — NOT 'dashed_arrow'. Requires a small addition
+                    # to the app's _arrowToolTypeFrom() so add_arrow can
+                    # actually create it (see accompanying notes).
+                    arrow_type = template["type"] if template["type"] in (
+                        "dashed_arrow", "dotted_arrow", "arrow", "dashed_open_arrow",
+                        "self_message_arrow", "self_message_dotted_arrow",
+                    ) else "dashed_open_arrow"
                     auto_fix = {
                         "fixable": True, "action": "add_arrow",
                         "from_element": template["from"], "to_element": template["to"],
-                        "message_label": gtext,
-                        "arrow_type": template["type"] if template["type"] in
-                        ("dashed_arrow", "dotted_arrow", "arrow") else "dashed_arrow",
+                        "message_label": guessed_msg or "",
+                        "arrow_type": arrow_type,
                     }
+                desc = f"The alt operand '{gtext}' has no message arrow inside it."
+                if guessed_msg:
+                    desc += f" The scenario suggests it should be '{guessed_msg}'."
                 errors.append({
                     "error_type": "MISSING_MESSAGE_IN_FRAGMENT",
                     "severity": "ERROR",
                     "element": gtext,
-                    "description": f"The alt operand '{gtext}' has no message arrow inside it.",
+                    "description": desc,
                     "suggestion": f"Add the expected message/response arrow inside the '{gtext}' operand.",
                     "auto_fix": auto_fix,
                 })
@@ -2538,7 +2660,7 @@ AUTO-FIX RULES:
 - UNLABELLED_ARROW → fixable: true, action: rename_shape, name: <message label from scenario>
 - MISSING_MESSAGE → fixable: true, action: add_arrow, from_element, to_element, message_label, arrow_type: arrow
 - MISSING_RETURN → fixable: true, action: add_arrow, from_element: <receiver>, to_element: <sender>, message_label: <return label>, arrow_type: dashed_arrow
-- MISSING_DELETION_SYMBOL → fixable: true, action: add_shape, shape_type: deletion_marker, name: <lifeline name>
+- MISSING_DELETION_SYMBOL → fixable: true, action: add_deletion_marker, name: <lifeline name>, from_element: <lifeline name>
 - MISSING_ACTIVATION → fixable: true, action: add_shape, shape_type: activation_box, name: <lifeline name>
 - MISSING_ALT_FRAGMENT → fixable: true, action: add_shape, shape_type: combined_fragment, name: alt
 - WRONG_ARROW_TYPE → fixable: true, action: change_arrow_type, arrow_type: dashed_arrow, from_element, to_element
@@ -3161,7 +3283,7 @@ For each error, provide an "auto_fix" object. Set "fixable": true only for these
 - WRONG_CLASS_CAPITALISATION → action: "rename_shape", name: <capitalised name>
 - MISSING_RELATIONSHIP / MISSING_MESSAGE → action: "add_arrow", from_element, to_element, arrow_type, message_label
 - MISSING_RETURN → action: "add_arrow", from_element, to_element, arrow_type: "dashed_arrow", message_label
-- MISSING_DELETION_SYMBOL → action: "add_shape", shape_type: "deletion_marker", name: <lifeline name>
+- MISSING_DELETION_SYMBOL → action: "add_deletion_marker", name: <lifeline name>, from_element: <lifeline name>, fixable: true
 - EMPTY_CLASS_NAME / UNLABELLED_LIFELINE / UNLABELLED_OBJECT → action: "rename_shape", name
 - DUPLICATE_* → action: "merge_shapes", name
 - SPELLING_MISTAKE → action: "rename_shape", name: <correct spelling from scenario>, fixable: true
