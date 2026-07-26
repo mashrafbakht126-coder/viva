@@ -2618,7 +2618,65 @@ Examples:
 - If an object shape's label is empty → report: "Object has no name. Add a name to the object box."
 - Do NOT say "lifeline has no name" when the shape type is `object` or `object_lifeline` — say "object has no name".
 
-## RULES TO CHECK (sequence diagram ONLY)
+## MANDATORY STRUCTURAL CHECKLIST — RUN THIS EVERY TIME, BEFORE ANYTHING ELSE
+Every correct sequence diagram needs certain elements. Go through this checklist
+against the scenario and the diagram shapes, in order, and report a violation
+for anything that fails:
+
+1. **Participants** — every person/system/object explicitly named in the scenario
+   must have a matching lifeline/object/actor box in the diagram, with the SAME
+   name (allowing minor spelling variants — see SPELLING_MISTAKE below).
+   - Count how many distinct participants the scenario describes, and count how
+     many lifeline/object/actor shapes the diagram has. If the diagram has FEWER
+     → report MISSING_LIFELINE for each missing one. If the diagram has MORE than
+     the scenario describes → report EXTRA_LIFELINE for each extra one.
+2. **At least one actor** — if the scenario describes a human/external initiator
+   ("customer", "user", "admin", "student", etc. does something), the diagram
+   MUST have at least one `actor` shape. If there is no actor shape at all in a
+   scenario that clearly has a human initiator → report MISSING_LIFELINE for
+   that actor specifically (not a generic message).
+3. **At least one object/system participant** — the scenario's system/service side
+   (e.g. "ATM System", "Server", "Database") must appear as a `lifeline` or
+   `object`/`object_lifeline` shape. Missing → MISSING_LIFELINE.
+4. **Sending (request) message arrows** — every request/call action described in
+   the scenario (customer does X, system does Y) needs a solid `arrow`. Missing →
+   MISSING_MESSAGE.
+5. **Return (response) message arrows** — every response/result described in the
+   scenario ("system returns...", "shows...", "displays...", "confirms...") needs
+   a `dashed_arrow`/`dashed_open_arrow`/`dotted_arrow`. Missing → MISSING_RETURN.
+6. **Activation bars** — any lifeline that receives at least one message must have
+   an `activation_box` on it. Missing → MISSING_ACTIVATION.
+7. **Deletion markers** — only required if the scenario explicitly implies the
+   object/session ends or is destroyed (e.g. "session ends", "object destroyed",
+   "connection closes"). Do NOT require deletion markers just because a lifeline
+   exists — most sequence diagrams don't destroy their participants.
+8. **Names must match the scenario exactly (or be a close variant)** — if a
+   lifeline/actor/object's name in the diagram is clearly meant to be a scenario
+   participant but is misspelled (e.g. "Custmer" for "Customer", "ATM Systm" for
+   "ATM System") → SPELLING_MISTAKE, not MISSING_LIFELINE and not EXTRA_LIFELINE.
+
+## MESSAGES — BOTH DIRECTIONS MUST BE CHECKED
+- **Scenario → Diagram**: an interaction described in the scenario but with NO
+  matching arrow anywhere in the diagram → MISSING_MESSAGE (or MISSING_RETURN
+  if it's specifically the response half of an interaction).
+- **Diagram → Scenario**: an arrow drawn in the diagram whose interaction is NOT
+  described anywhere in the scenario, and isn't a reasonable implementation
+  detail of something the scenario DOES describe → report EXTRA_MESSAGE
+  (WARNING). Do not report EXTRA_MESSAGE for messages that are a sensible,
+  smaller step of something the scenario describes in general terms (e.g. if
+  the scenario says "system validates the request" and the diagram splits this
+  into "check balance" + "check PIN", that is a reasonable elaboration, not an
+  extra/unrelated message — only flag messages that have no connection at all
+  to anything in the scenario).
+
+## COUNTING — CROSS-CHECK NUMBERS, NOT JUST NAMES
+- Count how many actor shapes exist vs how many distinct human participants the
+  scenario names. Mismatch in count is itself a signal something is missing or
+  extra, even before checking individual names.
+- Count how many object/lifeline (non-actor) shapes exist vs how many distinct
+  system/object participants the scenario names. Same cross-check.
+
+
 1. MISSING_LIFELINE — Every participant/object in scenario must have a lifeline or object box.
 2. EXTRA_LIFELINE — Lifeline not in scenario (warning).
 3. MISSING_MESSAGE — Important interaction in scenario not shown as a message arrow. Use semantic matching.
@@ -2637,6 +2695,7 @@ Examples:
 16. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow (ERROR).
 17. INCOMPLETE_MESSAGE_LABEL — A message arrow's label is cut short compared to the scenario's wording (e.g. 'request with' when the scenario says 'request withdrawal', or 'insert card' when the scenario says 'insert card and pin'). WARNING.
 18. MISSING_MESSAGE_IN_FRAGMENT — An alt/opt operand has a guard condition (e.g. '[sufficient balance]') drawn but no message arrow inside that operand's section of the fragment. ERROR.
+19. EXTRA_MESSAGE — A message arrow in the diagram represents an interaction that is not described anywhere in the scenario, and is not a reasonable smaller step of something the scenario does describe. WARNING.
 
 ## SEVERITY — CRITICAL:
 - ERROR (red): Missing lifelines, missing messages, wrong arrow type, invalid source/target, missing alt fragment
@@ -2671,6 +2730,7 @@ AUTO-FIX RULES:
 - SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 - INCOMPLETE_MESSAGE_LABEL → fixable: true, action: rename_shape, name: <full label from scenario>
 - MISSING_MESSAGE_IN_FRAGMENT → fixable: true, action: add_arrow, from_element, to_element, message_label: <the operand's guard text>, arrow_type: dashed_arrow
+- EXTRA_MESSAGE → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -2882,6 +2942,7 @@ _SEQUENCE_SEVERITY_MAP = {
     "spelling_mistake":        "WARNING",
     "incomplete_message_label": "WARNING",
     "missing_message_in_fragment": "ERROR",
+    "extra_message":            "WARNING",
 }
 
 
