@@ -1173,16 +1173,91 @@ def _seq_levenshtein(a: str, b: str) -> int:
     return prev[lb]
 
 
+def _seq_scenario_participant_candidates(scenario: str) -> List[str]:
+    """
+    Best-effort, scenario-independent extraction of likely PARTICIPANT names
+    from scenario text — words/short phrases that are capitalized (Title
+    Case), which is how these scenarios consistently name their actors and
+    system participants (e.g. 'Customer', 'ATM System', 'Library System',
+    'Patient', 'Hospital System'). Returns them in first-appearance order,
+    each as the ORIGINAL-CASE text (not lowercased) so a suggested name looks
+    correct when offered as a fix. Consecutive capitalized words are joined
+    into one candidate (e.g. 'ATM' + 'System' -> 'ATM System').
+    """
+    if not scenario:
+        return []
+    tokens = re.findall(r"[A-Za-z]+", scenario)
+    candidates: List[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        w = tokens[i]
+        if w[:1].isupper() and _n(w) not in _SEQ_STOPWORDS and len(w) > 1:
+            phrase = [w]
+            j = i + 1
+            while j < n and tokens[j][:1].isupper() and _n(tokens[j]) not in _SEQ_STOPWORDS:
+                phrase.append(tokens[j])
+                j += 1
+            candidates.append(" ".join(phrase))
+            i = j
+        else:
+            i += 1
+    # De-duplicate while preserving first-appearance order
+    seen = set()
+    out = []
+    for c in candidates:
+        k = _n(c)
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
 def _seq_closest_scenario_word(name: str, scenario: str) -> Optional[tuple]:
     """
     Return (closest_scenario_word, edit_distance) for a lifeline/actor/object
     name against the words used in the scenario text, or None if nothing
     close enough is found. Restricted to words of length >= 4 on both sides
     to avoid noisy false positives on short words.
+
+    Prefers matching against CAPITALIZED (Title Case) words/phrases first —
+    these are almost always the scenario's actual participant names — before
+    falling back to matching against any word in the scenario. Without this,
+    a shape name could be wrongly matched to an unrelated common word (e.g.
+    a generic verb or noun) that merely happens to be close in edit distance,
+    while the real intended participant name was a better, but non-preferred,
+    candidate.
     """
     n = _n(name)
     if not n or len(n) < 4 or not scenario:
         return None
+
+    # 1) Try capitalized participant-name candidates first.
+    proper_candidates = _seq_scenario_participant_candidates(scenario)
+    best_w, best_d = None, None
+    for cand in proper_candidates:
+        cn = _n(cand)
+        if len(cn) < 4 or abs(len(cn) - len(n)) > 2:
+            continue
+        d = _seq_levenshtein(n, cn)
+        if best_d is None or d < best_d:
+            best_d, best_w = d, cand
+        elif d == best_d:
+            # Tie-break: prefer the candidate sharing the same first letter
+            # as the shape's name — a much stronger signal of the actually
+            # intended word than "whichever appeared first in the scenario
+            # text", which is otherwise an arbitrary pick between equally
+            # plausible-looking matches (e.g. both 'User' and 'Server' can
+            # be 2 edits away from a name like 'Sver' — only the shared
+            # first letter tells you which one it was actually meant to be).
+            if best_w and cn[:1] != n[:1] and _n(best_w)[:1] == n[:1]:
+                continue
+            if best_w and cn[:1] == n[:1] and _n(best_w)[:1] != n[:1]:
+                best_d, best_w = d, cand
+    if best_w is not None:
+        return best_w, best_d
+
+    # 2) Fall back to any word in the scenario (previous behaviour).
     words = {w for w in re.findall(r"[a-zA-Z]+", scenario.lower()) if w not in _SEQ_STOPWORDS}
     best_w, best_d = None, None
     for w in words:
@@ -1356,6 +1431,25 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
     errors = []
     lifelines = {}
 
+    # Pre-pass: collect names already used by LABELED lifeline/object/actor
+    # shapes, so unnamed-shape suggestions below never recommend a name
+    # that's already taken by something else in the diagram.
+    _already_named = {_n(_shape_name(s)) for s in shapes
+                       if s.get("type") in ("lifeline", "object_lifeline", "actor")
+                       and _shape_name(s)}
+    _scenario_candidates = _seq_scenario_participant_candidates(scenario) if scenario else []
+    _suggested_so_far: set = set()
+
+    def _next_name_suggestion() -> Optional[str]:
+        """First scenario participant candidate not already on the diagram
+        and not already suggested to a different unnamed shape this run."""
+        for cand in _scenario_candidates:
+            cn = _n(cand)
+            if cn not in _already_named and cn not in _suggested_so_far:
+                _suggested_so_far.add(cn)
+                return cand
+        return None
+
     # ── Collect lifelines ──
     for s in shapes:
         t = s.get("type", "")
@@ -1364,22 +1458,27 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         name = _shape_name(s)
         n    = _n(name)
         if not n:
+            guessed = _next_name_suggestion()
             # FIX: Use correct terminology for object vs lifeline
             if t == "object_lifeline" or t == "object":
                 errors.append({
                     "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
                     "element": "(unnamed object)",
-                    "description": "An object lifeline has no name.",
-                    "suggestion": "Give this object a meaningful name.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Object"},
+                    "description": ("An object lifeline has no name." +
+                                    (f" The scenario suggests it should be '{guessed}'." if guessed else "")),
+                    "suggestion": (f"Rename this object to '{guessed}' to match the scenario."
+                                   if guessed else "Give this object a meaningful name."),
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": guessed or "Object"},
                 })
             else:
                 errors.append({
                     "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
                     "element": "(unnamed lifeline)",
-                    "description": "A lifeline has no name.",
-                    "suggestion": "Give this lifeline a meaningful name.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
+                    "description": ("A lifeline has no name." +
+                                    (f" The scenario suggests it should be '{guessed}'." if guessed else "")),
+                    "suggestion": (f"Rename this lifeline to '{guessed}' to match the scenario."
+                                   if guessed else "Give this lifeline a meaningful name."),
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": guessed or "Participant"},
                 })
         elif n in lifelines:
             errors.append({
@@ -1451,14 +1550,18 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             if not match:
                 continue
             close_word, dist = match
-            if 0 < dist <= 2 and close_word != _n(name):
+            if 0 < dist <= 2 and _n(close_word) != _n(name):
+                # Participant-candidate matches already carry correct casing
+                # (e.g. 'ATM System'); only the plain-word fallback path
+                # returns all-lowercase text that still needs capitalizing.
+                correct_name = close_word if close_word != close_word.lower() else close_word.capitalize()
                 errors.append({
                     "error_type": "SPELLING_MISTAKE",
                     "severity": "WARNING",
                     "element": name,
-                    "description": f"Lifeline name '{name}' looks like a misspelling of '{close_word}' used in the scenario.",
-                    "suggestion": f"Rename '{name}' to '{close_word.capitalize()}' to match the scenario spelling.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": close_word.capitalize()},
+                    "description": f"Lifeline name '{name}' looks like a misspelling of '{correct_name}' used in the scenario.",
+                    "suggestion": f"Rename '{name}' to '{correct_name}' to match the scenario spelling.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct_name},
                 })
 
     # ── Check for unlabelled arrows ──
