@@ -2636,10 +2636,10 @@ for anything that fails:
    scenario that clearly has a human initiator → report MISSING_LIFELINE for
    that actor specifically (not a generic message).
 3. **At least one object/system participant** — the scenario's system/service side
-   (e.g. "ATM System", "Server", "Database") must appear as a `lifeline` or
-   `object`/`object_lifeline` shape. Missing → MISSING_LIFELINE.
+   (e.g. a system, server, or service the scenario names) must appear as a
+   `lifeline` or `object`/`object_lifeline` shape. Missing → MISSING_LIFELINE.
 4. **Sending (request) message arrows** — every request/call action described in
-   the scenario (customer does X, system does Y) needs a solid `arrow`. Missing →
+   the scenario (one participant does X to another) needs a solid `arrow`. Missing →
    MISSING_MESSAGE.
 5. **Return (response) message arrows** — every response/result described in the
    scenario ("system returns...", "shows...", "displays...", "confirms...") needs
@@ -2652,8 +2652,30 @@ for anything that fails:
    exists — most sequence diagrams don't destroy their participants.
 8. **Names must match the scenario exactly (or be a close variant)** — if a
    lifeline/actor/object's name in the diagram is clearly meant to be a scenario
-   participant but is misspelled (e.g. "Custmer" for "Customer", "ATM Systm" for
-   "ATM System") → SPELLING_MISTAKE, not MISSING_LIFELINE and not EXTRA_LIFELINE.
+   participant but is misspelled (a couple of letters off, e.g. the scenario
+   names a "Library System" but the diagram shows "Libary Systm") → SPELLING_MISTAKE,
+   not MISSING_LIFELINE and not EXTRA_LIFELINE.
+
+## THIS CHECKLIST APPLIES TO ANY SCENARIO — NOT ONE FIXED DOMAIN
+The scenario text above could describe a bank, a library, a hospital, a food
+delivery app, a booking system, a school portal — literally anything. None of
+the rules above are tied to any specific domain, participant name, or message
+wording. Re-derive the list of required participants, messages, and conditions
+FRESH from whatever scenario text is given above — never reuse or assume names,
+counts, or structure from any other example. Two short illustrations of the
+SAME checklist applied to two unrelated domains:
+
+- Scenario: "A Student searches the Library System for a book. If it is
+  available, the Library issues it; otherwise it shows an unavailable message."
+  → Required: actor "Student", lifeline "Library System", solid arrow "search
+  book", an alt fragment with 2 operands ("available"/"not available"), a
+  dashed return arrow in EACH operand ("book issued" / "unavailable message").
+- Scenario: "A Patient books an appointment with the Hospital System. The
+  system checks doctor availability and confirms the booking."
+  → Required: actor "Patient", lifeline "Hospital System", solid arrow "book
+  appointment", a self-message or solid arrow for "check doctor availability",
+  a dashed return arrow "booking confirmed". No alt fragment needed here since
+  the scenario describes no conditional branching.
 
 ## MESSAGES — BOTH DIRECTIONS MUST BE CHECKED
 - **Scenario → Diagram**: an interaction described in the scenario but with NO
