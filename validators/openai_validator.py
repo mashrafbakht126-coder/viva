@@ -33,7 +33,7 @@ import re
 import time
 import urllib.request
 import urllib.error
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 
 _log = logging.getLogger(__name__)
 
@@ -1155,6 +1155,52 @@ _SEQ_STOPWORDS = {
 _SEQ_COMPOUND_CONNECTORS = {"and", "&", "or", "then"}
 
 
+_SEQ_GENERIC_LEADIN_WORDS = {"a", "an", "the", "this", "that", "draw", "create", "design"}
+
+
+def _seq_extract_scenario_participants_fallback(scenario: str) -> List[str]:
+    """
+    Lightweight, general fallback for extracting candidate participant names
+    from the scenario text — used only when spaCy's subject/verb/object
+    extraction (NLPExtractor) yields no usable interactions at all, which
+    happens often in practice (e.g. run-on scenario phrasing without clear
+    punctuation confuses the dependency parser, or the subject word happens
+    to be in NLPExtractor's generic STOPWORD_NOUNS list, like 'system' —
+    which is exactly the word a sequence diagram's self-message subject
+    often is, e.g. 'the ATM system checks the balance'). Not tied to any one
+    scenario's wording:
+      1. Multi-word Capitalized phrases (e.g. 'ATM System', 'Payment
+         Gateway') — the usual way a scenario names a system/actor.
+      2. Common role nouns from the shared _COMMON_ROLE_NOUNS list
+         (customer, user, admin, ...), including simple plural forms.
+    """
+    if not scenario:
+        return []
+    candidates: Set[str] = set()
+
+    for m in re.finditer(r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\b", scenario):
+        phrase = m.group(1).strip()
+        if phrase.split()[0].lower() not in _SEQ_GENERIC_LEADIN_WORDS:
+            candidates.add(phrase)
+
+    words = re.findall(r"[a-zA-Z]+", scenario.lower())
+    for w in words:
+        if w in _COMMON_ROLE_NOUNS:
+            candidates.add(w)
+        elif w.endswith("s") and w[:-1] in _COMMON_ROLE_NOUNS:
+            candidates.add(w[:-1])
+
+    # Drop a single-word candidate that's already a substring of a longer,
+    # multi-word candidate (e.g. 'system' when 'Library System' is already
+    # in the set) to avoid reporting the same missing participant twice.
+    multi_word = [c for c in candidates if " " in c]
+    deduped = {
+        c for c in candidates
+        if " " in c or not any(c.lower() in mw.lower() for mw in multi_word)
+    }
+    return sorted(deduped)
+
+
 def _seq_levenshtein(a: str, b: str) -> int:
     """Plain edit-distance DP — used only for sequence-diagram spelling checks."""
     if a == b:
@@ -1173,91 +1219,16 @@ def _seq_levenshtein(a: str, b: str) -> int:
     return prev[lb]
 
 
-def _seq_scenario_participant_candidates(scenario: str) -> List[str]:
-    """
-    Best-effort, scenario-independent extraction of likely PARTICIPANT names
-    from scenario text — words/short phrases that are capitalized (Title
-    Case), which is how these scenarios consistently name their actors and
-    system participants (e.g. 'Customer', 'ATM System', 'Library System',
-    'Patient', 'Hospital System'). Returns them in first-appearance order,
-    each as the ORIGINAL-CASE text (not lowercased) so a suggested name looks
-    correct when offered as a fix. Consecutive capitalized words are joined
-    into one candidate (e.g. 'ATM' + 'System' -> 'ATM System').
-    """
-    if not scenario:
-        return []
-    tokens = re.findall(r"[A-Za-z]+", scenario)
-    candidates: List[str] = []
-    i = 0
-    n = len(tokens)
-    while i < n:
-        w = tokens[i]
-        if w[:1].isupper() and _n(w) not in _SEQ_STOPWORDS and len(w) > 1:
-            phrase = [w]
-            j = i + 1
-            while j < n and tokens[j][:1].isupper() and _n(tokens[j]) not in _SEQ_STOPWORDS:
-                phrase.append(tokens[j])
-                j += 1
-            candidates.append(" ".join(phrase))
-            i = j
-        else:
-            i += 1
-    # De-duplicate while preserving first-appearance order
-    seen = set()
-    out = []
-    for c in candidates:
-        k = _n(c)
-        if k not in seen:
-            seen.add(k)
-            out.append(c)
-    return out
-
-
 def _seq_closest_scenario_word(name: str, scenario: str) -> Optional[tuple]:
     """
     Return (closest_scenario_word, edit_distance) for a lifeline/actor/object
     name against the words used in the scenario text, or None if nothing
     close enough is found. Restricted to words of length >= 4 on both sides
     to avoid noisy false positives on short words.
-
-    Prefers matching against CAPITALIZED (Title Case) words/phrases first —
-    these are almost always the scenario's actual participant names — before
-    falling back to matching against any word in the scenario. Without this,
-    a shape name could be wrongly matched to an unrelated common word (e.g.
-    a generic verb or noun) that merely happens to be close in edit distance,
-    while the real intended participant name was a better, but non-preferred,
-    candidate.
     """
     n = _n(name)
     if not n or len(n) < 4 or not scenario:
         return None
-
-    # 1) Try capitalized participant-name candidates first.
-    proper_candidates = _seq_scenario_participant_candidates(scenario)
-    best_w, best_d = None, None
-    for cand in proper_candidates:
-        cn = _n(cand)
-        if len(cn) < 4 or abs(len(cn) - len(n)) > 2:
-            continue
-        d = _seq_levenshtein(n, cn)
-        if best_d is None or d < best_d:
-            best_d, best_w = d, cand
-        elif d == best_d:
-            # Tie-break: prefer the candidate sharing the same first letter
-            # as the shape's name — a much stronger signal of the actually
-            # intended word than "whichever appeared first in the scenario
-            # text", which is otherwise an arbitrary pick between equally
-            # plausible-looking matches (e.g. both 'User' and 'Server' can
-            # be 2 edits away from a name like 'Sver' — only the shared
-            # first letter tells you which one it was actually meant to be).
-            if best_w and cn[:1] != n[:1] and _n(best_w)[:1] == n[:1]:
-                continue
-            if best_w and cn[:1] == n[:1] and _n(best_w)[:1] != n[:1]:
-                best_d, best_w = d, cand
-    if best_w is not None:
-        return best_w, best_d
-
-    # 2) Fall back to any word in the scenario (previous behaviour).
     words = {w for w in re.findall(r"[a-zA-Z]+", scenario.lower()) if w not in _SEQ_STOPWORDS}
     best_w, best_d = None, None
     for w in words:
@@ -1426,29 +1397,11 @@ def _seq_guess_fragment_message(guard_text: str, scenario: str) -> Optional[str]
     return None
 
 
-def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
+def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
+                          extracted: Optional[Dict[str, Any]] = None) -> List[Dict]:
     """Deterministic rule checks for sequence diagrams."""
     errors = []
     lifelines = {}
-
-    # Pre-pass: collect names already used by LABELED lifeline/object/actor
-    # shapes, so unnamed-shape suggestions below never recommend a name
-    # that's already taken by something else in the diagram.
-    _already_named = {_n(_shape_name(s)) for s in shapes
-                       if s.get("type") in ("lifeline", "object_lifeline", "actor")
-                       and _shape_name(s)}
-    _scenario_candidates = _seq_scenario_participant_candidates(scenario) if scenario else []
-    _suggested_so_far: set = set()
-
-    def _next_name_suggestion() -> Optional[str]:
-        """First scenario participant candidate not already on the diagram
-        and not already suggested to a different unnamed shape this run."""
-        for cand in _scenario_candidates:
-            cn = _n(cand)
-            if cn not in _already_named and cn not in _suggested_so_far:
-                _suggested_so_far.add(cn)
-                return cand
-        return None
 
     # ── Collect lifelines ──
     for s in shapes:
@@ -1458,27 +1411,22 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
         name = _shape_name(s)
         n    = _n(name)
         if not n:
-            guessed = _next_name_suggestion()
             # FIX: Use correct terminology for object vs lifeline
             if t == "object_lifeline" or t == "object":
                 errors.append({
                     "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
                     "element": "(unnamed object)",
-                    "description": ("An object lifeline has no name." +
-                                    (f" The scenario suggests it should be '{guessed}'." if guessed else "")),
-                    "suggestion": (f"Rename this object to '{guessed}' to match the scenario."
-                                   if guessed else "Give this object a meaningful name."),
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": guessed or "Object"},
+                    "description": "An object lifeline has no name.",
+                    "suggestion": "Give this object a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Object"},
                 })
             else:
                 errors.append({
                     "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
                     "element": "(unnamed lifeline)",
-                    "description": ("A lifeline has no name." +
-                                    (f" The scenario suggests it should be '{guessed}'." if guessed else "")),
-                    "suggestion": (f"Rename this lifeline to '{guessed}' to match the scenario."
-                                   if guessed else "Give this lifeline a meaningful name."),
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": guessed or "Participant"},
+                    "description": "A lifeline has no name.",
+                    "suggestion": "Give this lifeline a meaningful name.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": "Participant"},
                 })
         elif n in lifelines:
             errors.append({
@@ -1550,19 +1498,21 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
             if not match:
                 continue
             close_word, dist = match
-            if 0 < dist <= 2 and _n(close_word) != _n(name):
-                # Participant-candidate matches already carry correct casing
-                # (e.g. 'ATM System'); only the plain-word fallback path
-                # returns all-lowercase text that still needs capitalizing.
-                correct_name = close_word if close_word != close_word.lower() else close_word.capitalize()
+            if 0 < dist <= 2 and close_word != _n(name):
                 errors.append({
                     "error_type": "SPELLING_MISTAKE",
                     "severity": "WARNING",
                     "element": name,
-                    "description": f"Lifeline name '{name}' looks like a misspelling of '{correct_name}' used in the scenario.",
-                    "suggestion": f"Rename '{name}' to '{correct_name}' to match the scenario spelling.",
-                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": correct_name},
+                    "description": f"Lifeline name '{name}' looks like a misspelling of '{close_word}' used in the scenario.",
+                    "suggestion": f"Rename '{name}' to '{close_word.capitalize()}' to match the scenario spelling.",
+                    "auto_fix": {"fixable": True, "action": "rename_shape", "name": close_word.capitalize()},
                 })
+
+    # (General MISSING_LIFELINE / structural-completeness / scenario-vs-
+    # message coverage checks already exist further down in this function,
+    # using the NLPExtractor's structured 'extracted' data — see the
+    # "General structural invariants" and "Scenario-vs-diagram semantic
+    # checks" sections below.)
 
     # ── Check for unlabelled arrows ──
     arrow_count = 0
@@ -1891,17 +1841,150 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "") -> List[Dict]:
                              "shape_type": "combined_fragment", "name": "alt"},
             })
 
+    # ── General structural invariants (apply to EVERY sequence diagram) ────────
+    # Not tailored to any one scenario — these are baseline UML requirements.
+    has_actor = any(s.get("type") == "actor" for s in shapes)
+    has_object_or_lifeline = any(s.get("type") in ("object_lifeline", "lifeline") for s in shapes)
+    has_send_arrow = any(s.get("type") == "arrow" for s in shapes)
+    has_return_arrow = any(s.get("type") in ("dashed_arrow", "dashed_open_arrow", "dotted_arrow")
+                            for s in shapes)
+
+    if not has_actor:
+        errors.append({
+            "error_type": "MISSING_ACTOR",
+            "severity": "ERROR",
+            "element": "(diagram)",
+            "description": "No actor (stick figure) found — every sequence diagram needs at least one actor initiating the interaction.",
+            "suggestion": "Add an actor shape representing the user/initiator of the scenario.",
+            "auto_fix": {"fixable": True, "action": "add_shape", "shape_type": "actor", "name": "User"},
+        })
+    if not has_object_or_lifeline:
+        errors.append({
+            "error_type": "MISSING_LIFELINE_OBJECT",
+            "severity": "ERROR",
+            "element": "(diagram)",
+            "description": "No object/system lifeline found — at least one system/object participant is required to receive messages.",
+            "suggestion": "Add a lifeline/object box representing the system the actor interacts with.",
+            "auto_fix": {"fixable": True, "action": "add_shape", "shape_type": "object", "name": "System"},
+        })
+    if not has_send_arrow:
+        errors.append({
+            "error_type": "MISSING_MESSAGE_ARROW",
+            "severity": "ERROR",
+            "element": "(diagram)",
+            "description": "No solid message (call) arrow found — a sequence diagram needs at least one message sent between participants.",
+            "suggestion": "Add a solid arrow representing the initiating call/message.",
+            "auto_fix": {"fixable": False},
+        })
+    if has_send_arrow and not has_return_arrow:
+        errors.append({
+            "error_type": "MISSING_RETURN_ARROW",
+            "severity": "WARNING",
+            "element": "(diagram)",
+            "description": "No dashed return/response message found — most interactions should show a response back to the caller.",
+            "suggestion": "Add a dashed return arrow showing the response.",
+            "auto_fix": {"fixable": False},
+        })
+
+    # ── Scenario-vs-diagram semantic checks, using NLP extraction ──────────────
+    # This runs independently of the LLM call, so it works even when the LLM
+    # is unavailable/rate-limited/times out — not tied to any one scenario's
+    # wording, since it's driven by generic subject/verb/object extraction.
+    if extracted:
+        diagram_names = [_n(_shape_name(s)) for s in shapes
+                          if s.get("type") in ("actor", "lifeline", "object_lifeline")]
+        diagram_names = [n for n in diagram_names if n]
+
+        def _name_matches_diagram(candidate: str) -> bool:
+            if any(candidate == dn or candidate in dn or dn in candidate for dn in diagram_names):
+                return True
+            return any(_seq_levenshtein(candidate, dn) <= 2
+                       for dn in diagram_names if abs(len(dn) - len(candidate)) <= 2)
+
+        interactions = extracted.get("interactions") or []
+
+        # Missing lifeline: a recurring scenario SUBJECT with no matching
+        # participant shape on the diagram at all.
+        subject_seen = set()
+        for it in interactions:
+            subj = _n(str(it.get("from", "")))
+            if not subj or len(subj) < 3 or subj in subject_seen:
+                continue
+            subject_seen.add(subj)
+            if not _name_matches_diagram(subj):
+                errors.append({
+                    "error_type": "MISSING_LIFELINE",
+                    "severity": "WARNING",
+                    "element": subj.capitalize(),
+                    "description": f"The scenario describes '{subj}' performing an action, but no matching lifeline/actor/object was found on the diagram.",
+                    "suggestion": f"Add a lifeline or actor named '{subj.capitalize()}' to represent this participant.",
+                    "auto_fix": {"fixable": True, "action": "add_shape",
+                                 "shape_type": "lifeline", "name": subj.capitalize()},
+                })
+
+        # Fallback: supplements the NLP-derived subjects above. spaCy's SVO
+        # extraction only captures grammatical SUBJECTS, so it systematically
+        # misses a participant mentioned only as an object/recipient (e.g.
+        # 'borrows a book FROM the Library System' — 'Library System' is a
+        # prepositional object here, never a subject). It also frequently
+        # yields NOTHING at all for real-world scenario phrasing (confirmed
+        # by testing) — e.g. a run-on instructional preamble ('Draw a
+        # sequence diagram for a customer uses...') confuses the dependency
+        # parser. Always runs (not just when interactions is empty) so both
+        # sources combine; already-seen names are skipped via subject_seen.
+        if scenario:
+            for cand in _seq_extract_scenario_participants_fallback(scenario):
+                cand_n = _n(cand)
+                if not cand_n or cand_n in subject_seen:
+                    continue
+                subject_seen.add(cand_n)
+                if not _name_matches_diagram(cand_n):
+                    errors.append({
+                        "error_type": "MISSING_LIFELINE",
+                        "severity": "WARNING",
+                        "element": cand,
+                        "description": f"The scenario mentions '{cand}', but no matching lifeline/actor/object was found on the diagram.",
+                        "suggestion": f"Add a lifeline or actor named '{cand}' to represent this participant.",
+                        "auto_fix": {"fixable": True, "action": "add_shape",
+                                     "shape_type": "lifeline", "name": cand},
+                    })
+
+        # Missing message: a scenario action verb that never appears (even
+        # partially) in any message-arrow label on the diagram.
+        diagram_label_text = " | ".join(
+            str(s.get("label") or s.get("text") or "").strip().lower()
+            for s in shapes if s.get("type") in _SEQ_MESSAGE_TYPES
+        )
+        verb_seen = set()
+        for it in interactions:
+            verb = _n(str(it.get("message", "")))
+            if not verb or len(verb) < 3 or verb in verb_seen:
+                continue
+            verb_seen.add(verb)
+            if verb not in diagram_label_text:
+                frm, to = str(it.get("from", "")), str(it.get("to", ""))
+                endpoint_note = f" ({frm} → {to})" if frm and to else ""
+                errors.append({
+                    "error_type": "MISSING_MESSAGE",
+                    "severity": "WARNING",
+                    "element": verb,
+                    "description": f"The scenario describes a '{verb}' action{endpoint_note}, but no message arrow with a matching label was found on the diagram.",
+                    "suggestion": f"Add a message arrow labelled something like '{verb}' between the relevant participants.",
+                    "auto_fix": {"fixable": False},
+                })
+
     return errors
 
 
-def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "") -> List[Dict]:
+def _run_rule_checks(shapes: List[Dict], diagram_type: str, scenario: str = "",
+                      extracted: Optional[Dict[str, Any]] = None) -> List[Dict]:
     dt = diagram_type.lower()
     if "usecase" in dt or "use_case" in dt or "use case" in dt:
         return _rule_check_usecase(shapes)
     elif "class" in dt:
         return _rule_check_class(shapes, scenario)
     elif "sequence" in dt:
-        return _rule_check_sequence(shapes, scenario)
+        return _rule_check_sequence(shapes, scenario, extracted)
     return []
 
 
@@ -2721,87 +2804,7 @@ Examples:
 - If an object shape's label is empty → report: "Object has no name. Add a name to the object box."
 - Do NOT say "lifeline has no name" when the shape type is `object` or `object_lifeline` — say "object has no name".
 
-## MANDATORY STRUCTURAL CHECKLIST — RUN THIS EVERY TIME, BEFORE ANYTHING ELSE
-Every correct sequence diagram needs certain elements. Go through this checklist
-against the scenario and the diagram shapes, in order, and report a violation
-for anything that fails:
-
-1. **Participants** — every person/system/object explicitly named in the scenario
-   must have a matching lifeline/object/actor box in the diagram, with the SAME
-   name (allowing minor spelling variants — see SPELLING_MISTAKE below).
-   - Count how many distinct participants the scenario describes, and count how
-     many lifeline/object/actor shapes the diagram has. If the diagram has FEWER
-     → report MISSING_LIFELINE for each missing one. If the diagram has MORE than
-     the scenario describes → report EXTRA_LIFELINE for each extra one.
-2. **At least one actor** — if the scenario describes a human/external initiator
-   ("customer", "user", "admin", "student", etc. does something), the diagram
-   MUST have at least one `actor` shape. If there is no actor shape at all in a
-   scenario that clearly has a human initiator → report MISSING_LIFELINE for
-   that actor specifically (not a generic message).
-3. **At least one object/system participant** — the scenario's system/service side
-   (e.g. a system, server, or service the scenario names) must appear as a
-   `lifeline` or `object`/`object_lifeline` shape. Missing → MISSING_LIFELINE.
-4. **Sending (request) message arrows** — every request/call action described in
-   the scenario (one participant does X to another) needs a solid `arrow`. Missing →
-   MISSING_MESSAGE.
-5. **Return (response) message arrows** — every response/result described in the
-   scenario ("system returns...", "shows...", "displays...", "confirms...") needs
-   a `dashed_arrow`/`dashed_open_arrow`/`dotted_arrow`. Missing → MISSING_RETURN.
-6. **Activation bars** — any lifeline that receives at least one message must have
-   an `activation_box` on it. Missing → MISSING_ACTIVATION.
-7. **Deletion markers** — only required if the scenario explicitly implies the
-   object/session ends or is destroyed (e.g. "session ends", "object destroyed",
-   "connection closes"). Do NOT require deletion markers just because a lifeline
-   exists — most sequence diagrams don't destroy their participants.
-8. **Names must match the scenario exactly (or be a close variant)** — if a
-   lifeline/actor/object's name in the diagram is clearly meant to be a scenario
-   participant but is misspelled (a couple of letters off, e.g. the scenario
-   names a "Library System" but the diagram shows "Libary Systm") → SPELLING_MISTAKE,
-   not MISSING_LIFELINE and not EXTRA_LIFELINE.
-
-## THIS CHECKLIST APPLIES TO ANY SCENARIO — NOT ONE FIXED DOMAIN
-The scenario text above could describe a bank, a library, a hospital, a food
-delivery app, a booking system, a school portal — literally anything. None of
-the rules above are tied to any specific domain, participant name, or message
-wording. Re-derive the list of required participants, messages, and conditions
-FRESH from whatever scenario text is given above — never reuse or assume names,
-counts, or structure from any other example. Two short illustrations of the
-SAME checklist applied to two unrelated domains:
-
-- Scenario: "A Student searches the Library System for a book. If it is
-  available, the Library issues it; otherwise it shows an unavailable message."
-  → Required: actor "Student", lifeline "Library System", solid arrow "search
-  book", an alt fragment with 2 operands ("available"/"not available"), a
-  dashed return arrow in EACH operand ("book issued" / "unavailable message").
-- Scenario: "A Patient books an appointment with the Hospital System. The
-  system checks doctor availability and confirms the booking."
-  → Required: actor "Patient", lifeline "Hospital System", solid arrow "book
-  appointment", a self-message or solid arrow for "check doctor availability",
-  a dashed return arrow "booking confirmed". No alt fragment needed here since
-  the scenario describes no conditional branching.
-
-## MESSAGES — BOTH DIRECTIONS MUST BE CHECKED
-- **Scenario → Diagram**: an interaction described in the scenario but with NO
-  matching arrow anywhere in the diagram → MISSING_MESSAGE (or MISSING_RETURN
-  if it's specifically the response half of an interaction).
-- **Diagram → Scenario**: an arrow drawn in the diagram whose interaction is NOT
-  described anywhere in the scenario, and isn't a reasonable implementation
-  detail of something the scenario DOES describe → report EXTRA_MESSAGE
-  (WARNING). Do not report EXTRA_MESSAGE for messages that are a sensible,
-  smaller step of something the scenario describes in general terms (e.g. if
-  the scenario says "system validates the request" and the diagram splits this
-  into "check balance" + "check PIN", that is a reasonable elaboration, not an
-  extra/unrelated message — only flag messages that have no connection at all
-  to anything in the scenario).
-
-## COUNTING — CROSS-CHECK NUMBERS, NOT JUST NAMES
-- Count how many actor shapes exist vs how many distinct human participants the
-  scenario names. Mismatch in count is itself a signal something is missing or
-  extra, even before checking individual names.
-- Count how many object/lifeline (non-actor) shapes exist vs how many distinct
-  system/object participants the scenario names. Same cross-check.
-
-
+## RULES TO CHECK (sequence diagram ONLY)
 1. MISSING_LIFELINE — Every participant/object in scenario must have a lifeline or object box.
 2. EXTRA_LIFELINE — Lifeline not in scenario (warning).
 3. MISSING_MESSAGE — Important interaction in scenario not shown as a message arrow. Use semantic matching.
@@ -2820,7 +2823,6 @@ SAME checklist applied to two unrelated domains:
 16. WRONG_ARROW_TYPE — Return/response message uses solid arrow instead of dashed arrow (ERROR).
 17. INCOMPLETE_MESSAGE_LABEL — A message arrow's label is cut short compared to the scenario's wording (e.g. 'request with' when the scenario says 'request withdrawal', or 'insert card' when the scenario says 'insert card and pin'). WARNING.
 18. MISSING_MESSAGE_IN_FRAGMENT — An alt/opt operand has a guard condition (e.g. '[sufficient balance]') drawn but no message arrow inside that operand's section of the fragment. ERROR.
-19. EXTRA_MESSAGE — A message arrow in the diagram represents an interaction that is not described anywhere in the scenario, and is not a reasonable smaller step of something the scenario does describe. WARNING.
 
 ## SEVERITY — CRITICAL:
 - ERROR (red): Missing lifelines, missing messages, wrong arrow type, invalid source/target, missing alt fragment
@@ -2855,7 +2857,6 @@ AUTO-FIX RULES:
 - SPELLING_MISTAKE → fixable: true, action: rename_shape, name: <correct spelling from scenario>
 - INCOMPLETE_MESSAGE_LABEL → fixable: true, action: rename_shape, name: <full label from scenario>
 - MISSING_MESSAGE_IN_FRAGMENT → fixable: true, action: add_arrow, from_element, to_element, message_label: <the operand's guard text>, arrow_type: dashed_arrow
-- EXTRA_MESSAGE → fixable: false
 
 ## RESPONSE FORMAT (JSON only, no markdown)
 {{
@@ -3067,7 +3068,6 @@ _SEQUENCE_SEVERITY_MAP = {
     "spelling_mistake":        "WARNING",
     "incomplete_message_label": "WARNING",
     "missing_message_in_fragment": "ERROR",
-    "extra_message":            "WARNING",
 }
 
 
@@ -3176,7 +3176,7 @@ def validate_with_openai(
     _log.info("Sanitized shapes: %d → %d (diagram: %s)", len(shapes), len(clean_shapes), diagram_type)
 
     # Step 2 — Run deterministic rule-based checks (connections, duplicates, empty names)
-    rule_errors = _run_rule_checks(clean_shapes, diagram_type, scenario)
+    rule_errors = _run_rule_checks(clean_shapes, diagram_type, scenario, extracted)
     _log.info("Rule checks: %d issues found", len(rule_errors))
 
     # Step 3 — Ask LLM only for scenario-semantic checks
