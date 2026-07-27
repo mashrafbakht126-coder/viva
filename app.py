@@ -35,8 +35,8 @@ extractor = NLPExtractor()
 # OpenAI API config
 _OPENAI_API_BASE = "https://api.openai.com/v1"
 _VISION_MODELS   = ["gpt-4o-mini"]   # FIX: gpt-4o-mini use
-_TIMEOUT         = 120               # FIX:  (worker crash close)
-_RETRY_WAIT      = 65                # wait seconds on Rate limit
+_TIMEOUT_SECONDS = 60               # FIX:  (worker crash close)
+_RETRY_WAIT      = 15               # wait seconds on Rate limit
 
 
 def _get_api_key():
