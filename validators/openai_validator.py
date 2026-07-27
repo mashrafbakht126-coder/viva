@@ -1946,7 +1946,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                 })
 
     if scenario and not has_fragment:
-        cond_kw = ("if ", "if,", "otherwise", "else", "in case", "when ",
+        cond_kw = ("if ", "if,", "otherwise", "else", "in case",
                    "either", " or ", "depending on", "based on whether")
         scen_l = f" {scenario.lower()} "
         looks_conditional = any(kw in scen_l for kw in cond_kw)
