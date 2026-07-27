@@ -1798,13 +1798,29 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
             if to:
                 receivers.add(to)
     
-    # Collect lifelines that have activation bars
+    # Collect lifelines that have activation bars. Mirrors the deletion-
+    # marker check below: match by the box's on-screen x-position FIRST
+    # (nearest lifeline), falling back to the lifelineRef/name string only
+    # when no position data is available. The app frequently leaves
+    # lifelineRef blank on an activation box that is still clearly drawn on
+    # a specific lifeline on-screen — relying on the string alone silently
+    # missed those, which is exactly why activation detection worked for
+    # some diagrams (whichever happened to have lifelineRef populated) and
+    # not others.
     activations = set()
     for s in shapes:
         if s.get("type") == "activation_box":
-            ref = str(s.get("lifelineRef", "") or s.get("name", "") or "")
-            if ref:
-                activations.add(_n(ref))
+            matched = None
+            pos = _geo_pos(s)
+            if pos is not None:
+                w, _h = _geo_size(s)
+                matched = _seq_nearest_lifeline_by_x(pos[0] + w / 2.0)
+            if not matched:
+                ref = str(s.get("lifelineRef", "") or s.get("name", "") or "")
+                if ref:
+                    matched = _n(ref)
+            if matched:
+                activations.add(matched)
     
     # Check for missing activations
     for receiver in receivers:
