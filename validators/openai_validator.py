@@ -1207,6 +1207,12 @@ def _seq_extract_scenario_participants_fallback(scenario: str) -> List[str]:
             continue
         candidates.add(phrase)
 
+    for m in re.finditer(r"\b(?:with|from|to|via|using|into)\s+(?:the\s+|an?\s+)?([A-Z][a-zA-Z]{2,})\b", scenario):
+        word = m.group(1)
+        if word.lower() in _SEQ_GENERIC_LEADIN_WORDS or word.lower() in _SEQ_OUTCOME_WORDS:
+            continue
+        candidates.add(word)
+
     words = re.findall(r"[a-zA-Z]+", scenario.lower())
     for w in words:
         if w in _COMMON_ROLE_NOUNS:
@@ -1429,78 +1435,6 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     unnamed_shape_errors = []  # (error_dict, shape_type) — reconciled with
                                # MISSING_LIFELINE candidates at the end.
 
-    # ── Object boxes auto-create a linked dashed lifeline underneath them
-    # (Dart: CanvasModel.addShape, ToolType.object → auto-adds a paired
-    # ToolType.lifeLine with linkedId pointing back to the object, and its
-    # text is kept in sync on rename — see updateTextShapeContent). That
-    # paired lifeline is the SAME visual participant as the object box, not
-    # a second one — so when it's unnamed we must NOT raise a second,
-    # separate "no name" error for it. Collect the ids of those paired
-    # lifelines up front so the loop below can skip them.
-    _paired_lifeline_ids = set()
-    for s in shapes:
-        if s.get("type") in ("object_lifeline", "object"):
-            lid = s.get("linkedId")
-            if lid:
-                _paired_lifeline_ids.add(str(lid))
-
-    # ── Scenario participant candidates for naming unnamed objects/lifelines.
-    # Built directly from the scenario text UP FRONT (not derived from
-    # already-generated MISSING_LIFELINE errors) so a missing name always
-    # gets matched against the scenario, even when NLPExtractor's
-    # subject/verb/object parse finds nothing usable — which happens often
-    # for exactly this kind of subject (see
-    # _seq_extract_scenario_participants_fallback's docstring: a generic
-    # noun like 'system' is frequently filtered out by NLPExtractor's own
-    # stopword list, even though it's exactly what an unnamed object/
-    # lifeline is usually meant to be called, e.g. 'the ATM System').
-    _already_named = set()
-    for s in shapes:
-        if s.get("type") in ("actor", "lifeline", "object_lifeline"):
-            nm = _n(_shape_name(s))
-            if nm:
-                _already_named.add(nm)
-
-    def _seq_candidate_already_on_diagram(candidate: str) -> bool:
-        c = _n(candidate)
-        if not c:
-            return False
-        if any(c == dn or c in dn or dn in c for dn in _already_named):
-            return True
-        return any(_seq_levenshtein(c, dn) <= 2
-                   for dn in _already_named if abs(len(dn) - len(c)) <= 2)
-
-    _scenario_candidates: List[str] = []  # display-cased, priority order
-    _seen_cand_norm: Set[str] = set()
-    if extracted:
-        for it in (extracted.get("interactions") or []):
-            for key in ("from", "to"):
-                raw = str(it.get(key, "") or "").strip()
-                norm = _n(raw)
-                if norm and len(norm) >= 3 and norm not in _seen_cand_norm:
-                    _seen_cand_norm.add(norm)
-                    _scenario_candidates.append(raw[:1].upper() + raw[1:] if raw else raw)
-    if scenario:
-        for cand in _seq_extract_scenario_participants_fallback(scenario):
-            norm = _n(cand)
-            if norm and norm not in _seen_cand_norm:
-                _seen_cand_norm.add(norm)
-                _scenario_candidates.append(cand)
-
-    # Only candidates not already represented by a NAMED shape are usable,
-    # and role-noun candidates (customer, user, admin, ...) are reserved for
-    # unnamed ACTORS elsewhere — an object/lifeline should get a system-like
-    # name, never a person's role.
-    _unused_system_candidates = [
-        c for c in _scenario_candidates
-        if not _seq_candidate_already_on_diagram(c) and _n(c) not in _COMMON_ROLE_NOUNS
-    ]
-
-    def _pop_system_candidate() -> Optional[str]:
-        if _unused_system_candidates:
-            return _unused_system_candidates.pop(0)
-        return None
-
     # ── Collect lifelines ──
     for idx, s in enumerate(shapes):
         t = s.get("type", "")
@@ -1508,91 +1442,68 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
             continue
         name = _shape_name(s)
         n    = _n(name)
-        shape_id = s.get("id")
-        is_paired_child_lifeline = (
-            t == "lifeline" and shape_id is not None
-            and str(shape_id) in _paired_lifeline_ids
-        )
         if not n:
             pos = _geo_pos(s)
             pos_dict = {"dx": pos[0], "dy": pos[1]} if pos else None
-            # Identify WHICH unnamed shape this is, WITHOUT leaking raw
-            # canvas coordinates into the user-facing text — a plain
-            # counter is enough to tell multiple unnamed objects/lifelines
-            # on the same diagram apart. The real position still travels
-            # inside auto_fix (pos_dict) so the Dart fix button can find
-            # the exact shape.
-            location = f" #{idx + 1}"
+            # Identify WHICH unnamed shape this is (by position) so multiple
+            # unnamed objects/lifelines on the same diagram aren't reported
+            # as identical, indistinguishable errors.
+            location = f" at position {int(pos[0])},{int(pos[1])}" if pos else f" #{idx + 1}"
+
+            # Context: which messages connect to this unnamed shape, found by
+            # x-proximity to the arrow's start/end point. Single-word system
+            # names (e.g. 'Database') can't be reliably auto-derived from the
+            # scenario without unacceptable false-positive risk (confirmed by
+            # testing — plain NOUN/PROPN extraction flags almost every noun
+            # in the sentence as a candidate). Listing the connected messages
+            # instead lets the person pick the right name themselves.
+            context_labels = []
+            if pos is not None:
+                w0, _h0 = _geo_size(s)
+                cx = pos[0] + w0 / 2.0
+                for other in shapes:
+                    if other.get("type") not in _SEQ_MESSAGE_TYPES:
+                        continue
+                    opos = _geo_pos(other)
+                    if opos is None:
+                        continue
+                    oend = _geo_end_abs(other) or opos
+                    near = abs(opos[0] - cx) <= 90 or abs(oend[0] - cx) <= 90
+                    if not near:
+                        continue
+                    lbl = str(other.get("label") or other.get("text") or "").strip()
+                    if lbl:
+                        context_labels.append(lbl)
+            context_note = f" It is connected to message(s): {', '.join(context_labels[:3])}." if context_labels else ""
+
             # FIX: Use correct terminology for object vs lifeline
             if t == "object_lifeline" or t == "object":
-                cand = _pop_system_candidate()
-                if cand:
-                    desc_suffix = f" The scenario suggests this should be '{cand}'."
-                    suggestion_txt = f"Name this object '{cand}', as described in the scenario."
-                    fix_name = cand
-                else:
-                    desc_suffix = ""
-                    suggestion_txt = "Give this object a meaningful name."
-                    fix_name = "Object"
                 _u_err = {
                     "error_type": "UNLABELLED_OBJECT", "severity": "WARNING",
                     "element": f"(unnamed object{location})",
-                    "description": f"An object lifeline{location} has no name.{desc_suffix}",
-                    "suggestion": suggestion_txt,
-                    # 'label_lifeline' (not 'rename_shape'): rename_shape finds
-                    # its target by matching EXISTING text, which is blank
-                    # here and can never match — position (and shape_id, when
-                    # available) identifies the specific shape instead, same
-                    # pattern as 'label_arrow'. 'name' is the scenario-matched
-                    # name shown in the error above — the fix button applies
-                    # exactly that name, never a generic placeholder, unless
-                    # no scenario match was found.
-                    "auto_fix": {"fixable": True, "action": "label_lifeline",
-                                 "name": fix_name, "position": pos_dict,
-                                 "shape_id": shape_id},
-                }
-                errors.append(_u_err)
-                unnamed_shape_errors.append((_u_err, t))
-            elif is_paired_child_lifeline:
-                # Same participant as its parent object box — the object's
-                # own UNLABELLED_OBJECT error above already covers it, and
-                # naming the object also renames this lifeline (name sync).
-                # Skip raising a duplicate error, but still register it
-                # below under a synthetic key so activation/deletion/message
-                # checks further down keep seeing it.
-                pass
-            elif t == "lifeline":
-                cand = _pop_system_candidate()
-                if cand:
-                    desc_suffix = f" The scenario suggests this should be '{cand}'."
-                    suggestion_txt = f"Name this lifeline '{cand}', as described in the scenario."
-                    fix_name = cand
-                else:
-                    desc_suffix = ""
-                    suggestion_txt = "Give this lifeline a meaningful name."
-                    fix_name = "Participant"
-                _u_err = {
-                    "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
-                    "element": f"(unnamed lifeline{location})",
-                    "description": f"A lifeline{location} has no name.{desc_suffix}",
-                    "suggestion": suggestion_txt,
-                    "auto_fix": {"fixable": True, "action": "label_lifeline",
-                                 "name": fix_name, "position": pos_dict,
-                                 "shape_id": shape_id},
+                    "description": f"An object lifeline{location} has no name.{context_note}",
+                    "suggestion": "Give this object a meaningful name.",
+                    # Not fixable by default: we don't yet know what this
+                    # object should be called. Writing a generic placeholder
+                    # like 'Object' into the shape would be worse than no fix
+                    # at all. The reconciliation pass below turns this into a
+                    # real, working fix ONLY when the scenario clearly
+                    # supplies a name for it — otherwise it stays disabled so
+                    # the person names it manually using the message context
+                    # above.
+                    "auto_fix": {"fixable": False, "action": "label_lifeline",
+                                 "position": pos_dict},
                 }
                 errors.append(_u_err)
                 unnamed_shape_errors.append((_u_err, t))
             else:
-                # t == "actor" here — left exactly as before (unchanged),
-                # reconciled with a role-noun candidate further below.
                 _u_err = {
                     "error_type": "UNLABELLED_LIFELINE", "severity": "WARNING",
                     "element": f"(unnamed lifeline{location})",
-                    "description": f"A lifeline{location} has no name.",
+                    "description": f"A lifeline{location} has no name.{context_note}",
                     "suggestion": "Give this lifeline a meaningful name.",
-                    "auto_fix": {"fixable": True, "action": "label_lifeline",
-                                 "name": "Participant", "position": pos_dict,
-                                 "shape_id": shape_id},
+                    "auto_fix": {"fixable": False, "action": "label_lifeline",
+                                 "position": pos_dict},
                 }
                 errors.append(_u_err)
                 unnamed_shape_errors.append((_u_err, t))
@@ -2168,31 +2079,39 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     "auto_fix": {"fixable": False},
                 })
 
-    # ── Reconcile unnamed ACTORS with scenario-derived missing-participant
+    # ── Reconcile unnamed shapes with scenario-derived missing-participant
     # candidates ─────────────────────────────────────────────────────────
-    # An unnamed actor and a "scenario mentions X but no matching lifeline
-    # exists" finding are very often the SAME underlying issue — the person
-    # drew the shape but never typed its name. Pair them up using a
-    # role-noun-style candidate (customer, user, admin, ...) since that's
-    # what actors are usually called. (Unnamed OBJECT/LIFELINE shapes are
-    # matched to the scenario earlier, inline, while the errors are first
-    # built — not here — so only "actor" is handled in this pass.)
+    # An unnamed lifeline/object/actor and a "scenario mentions X but no
+    # matching lifeline exists" finding are very often the SAME underlying
+    # issue — the person drew the shape but never typed its name. Instead of
+    # reporting both separately (and suggesting a generic placeholder name),
+    # pair them up: an unnamed ACTOR gets a role-noun-style candidate
+    # (customer, user, admin, ...) since that's what actors are usually
+    # called; an unnamed OBJECT/LIFELINE gets a non-role (system-like, e.g.
+    # 'Server') candidate, since that's what systems/services are usually
+    # called. Only pairs when a like-for-like candidate is available —
+    # never guesses a candidate of the wrong kind onto a shape.
     missing_lifeline_idxs = [i for i, e in enumerate(errors) if e["error_type"] == "MISSING_LIFELINE"]
     role_candidate_idxs = [i for i in missing_lifeline_idxs if _n(errors[i]["element"]) in _COMMON_ROLE_NOUNS]
+    system_candidate_idxs = [i for i in missing_lifeline_idxs if i not in role_candidate_idxs]
     consumed_idxs = set()
 
     for u_err, u_type in unnamed_shape_errors:
-        if u_type != "actor":
-            continue
-        pick = next((i for i in role_candidate_idxs if i not in consumed_idxs), None)
+        pool = role_candidate_idxs if u_type == "actor" else system_candidate_idxs
+        pick = next((i for i in pool if i not in consumed_idxs), None)
         if pick is None:
             continue
         consumed_idxs.add(pick)
         cand_name = errors[pick]["element"]
+        # State the missing name directly in 'element' (not just buried in
+        # the description), and only NOW mark this fixable — we have an
+        # actual scenario-derived name to write, not a generic placeholder.
+        u_err["element"] = f"(missing name: '{cand_name}')"
         u_err["description"] = (
-            f"{u_err['description']} The scenario suggests this should be '{cand_name}'."
+            f"{u_err['description']} The scenario indicates this participant should be named '{cand_name}'."
         )
-        u_err["suggestion"] = f"Name this actor '{cand_name}', as described in the scenario."
+        u_err["suggestion"] = f"Name this {'actor' if u_type == 'actor' else 'object'} '{cand_name}', as described in the scenario."
+        u_err["auto_fix"]["fixable"] = True
         u_err["auto_fix"]["name"] = cand_name
 
     if consumed_idxs:
