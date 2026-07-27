@@ -1509,6 +1509,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
         if not n:
             pos = _geo_pos(s)
             pos_dict = {"dx": pos[0], "dy": pos[1]} if pos else None
+            shape_id = s.get("id")
 
             # Context: which messages connect to this unnamed shape, found by
             # x-proximity to the arrow's start/end point. Single-word system
@@ -1557,7 +1558,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     # the person names it manually using the message context
                     # above.
                     "auto_fix": {"fixable": False, "action": "label_lifeline",
-                                 "position": pos_dict},
+                                 "position": pos_dict, "shape_id": shape_id},
                 }
                 errors.append(_u_err)
                 unnamed_shape_errors.append((_u_err, t))
@@ -1568,7 +1569,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     "description": "A lifeline has no name.",
                     "suggestion": f"Give this lifeline a meaningful name.{context_hint}",
                     "auto_fix": {"fixable": False, "action": "label_lifeline",
-                                 "position": pos_dict},
+                                 "position": pos_dict, "shape_id": shape_id},
                 }
                 errors.append(_u_err)
                 unnamed_shape_errors.append((_u_err, t))
