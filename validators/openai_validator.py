@@ -1169,6 +1169,37 @@ _SEQ_HUMAN_ACTOR_WORDS = _COMMON_ROLE_NOUNS - {
 }
 
 
+def _seq_is_human_role_candidate(candidate: str) -> bool:
+    """
+    Decide whether a scenario-derived participant NAME logically belongs on
+    an actor (a human/role) or an object/lifeline (a system/service) — used
+    both to pick the right shape_type for a MISSING_LIFELINE fix and to pick
+    the right candidate pool when naming an unnamed actor vs object.
+
+    A plain exact-match against _SEQ_HUMAN_ACTOR_WORDS (the previous
+    behaviour) only recognises a candidate that IS one of the listed words —
+    it misses the much more common case of a compound scenario phrase like
+    'Bank Customer', 'System Administrator', or 'Warehouse Employee', where
+    the head noun (the role) is just one word inside a longer phrase. This
+    checks every word of the candidate (singularising simple plurals, same
+    as the extraction step), so a role word ANYWHERE in the phrase counts —
+    while a phrase made only of non-role/system words (e.g. 'ATM System',
+    'Payment Gateway', 'Library Database') correctly stays classified as an
+    object, since none of its words are human-role words.
+    """
+    c = _n(candidate)
+    if not c:
+        return False
+    if c in _SEQ_HUMAN_ACTOR_WORDS:
+        return True
+    for w in c.split():
+        if w in _SEQ_HUMAN_ACTOR_WORDS:
+            return True
+        if w.endswith("s") and w[:-1] in _SEQ_HUMAN_ACTOR_WORDS:
+            return True
+    return False
+
+
 _SEQ_GENERIC_LEADIN_WORDS = {"a", "an", "the", "this", "that", "draw", "create", "design"}
 
 # Words that mark a phrase as a message OUTCOME/STATUS/RESULT rather than a
@@ -2033,14 +2064,17 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                 continue
             subject_seen.add(subj)
             if not _name_matches_diagram(subj):
+                subj_disp = subj.capitalize()
+                is_human = _seq_is_human_role_candidate(subj)
                 errors.append({
                     "error_type": "MISSING_LIFELINE",
                     "severity": "WARNING",
-                    "element": subj.capitalize(),
-                    "description": f"The scenario describes '{subj}' performing an action, but no matching lifeline/actor/object was found on the diagram.",
-                    "suggestion": f"Add a lifeline or actor named '{subj.capitalize()}' to represent this participant.",
+                    "element": subj_disp,
+                    "description": f"The scenario describes '{subj}' performing an action, but no matching {'actor' if is_human else 'lifeline/object'} was found on the diagram.",
+                    "suggestion": f"Add an {'actor' if is_human else 'object/lifeline'} named '{subj_disp}' to represent this participant.",
                     "auto_fix": {"fixable": True, "action": "add_shape",
-                                 "shape_type": "lifeline", "name": subj.capitalize()},
+                                 "shape_type": "actor" if is_human else "lifeline",
+                                 "name": subj_disp},
                 })
 
         # Fallback: supplements the NLP-derived subjects above. spaCy's SVO
@@ -2060,14 +2094,16 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
                     continue
                 subject_seen.add(cand_n)
                 if not _name_matches_diagram(cand_n):
+                    is_human = _seq_is_human_role_candidate(cand)
                     errors.append({
                         "error_type": "MISSING_LIFELINE",
                         "severity": "WARNING",
                         "element": cand,
-                        "description": f"The scenario mentions '{cand}', but no matching lifeline/actor/object was found on the diagram.",
-                        "suggestion": f"Add a lifeline or actor named '{cand}' to represent this participant.",
+                        "description": f"The scenario mentions '{cand}', but no matching {'actor' if is_human else 'lifeline/object'} was found on the diagram.",
+                        "suggestion": f"Add an {'actor' if is_human else 'object/lifeline'} named '{cand}' to represent this participant.",
                         "auto_fix": {"fixable": True, "action": "add_shape",
-                                     "shape_type": "lifeline", "name": cand},
+                                     "shape_type": "actor" if is_human else "lifeline",
+                                     "name": cand},
                     })
 
         # Missing message: a scenario action verb that never appears (even
@@ -2107,7 +2143,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     # called. Only pairs when a like-for-like candidate is available —
     # never guesses a candidate of the wrong kind onto a shape.
     missing_lifeline_idxs = [i for i, e in enumerate(errors) if e["error_type"] == "MISSING_LIFELINE"]
-    role_candidate_idxs = [i for i in missing_lifeline_idxs if _n(errors[i]["element"]) in _SEQ_HUMAN_ACTOR_WORDS]
+    role_candidate_idxs = [i for i in missing_lifeline_idxs if _seq_is_human_role_candidate(errors[i]["element"])]
     system_candidate_idxs = [i for i in missing_lifeline_idxs if i not in role_candidate_idxs]
     consumed_idxs = set()
 
