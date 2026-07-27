@@ -1200,7 +1200,11 @@ def _seq_is_human_role_candidate(candidate: str) -> bool:
     return False
 
 
-_SEQ_GENERIC_LEADIN_WORDS = {"a", "an", "the", "this", "that", "draw", "create", "design"}
+_SEQ_GENERIC_LEADIN_WORDS = {
+    "a", "an", "the", "this", "that", "these", "those", "draw", "create",
+    "design", "its", "their", "his", "her", "our", "your", "my", "each",
+    "every", "some", "any", "all",
+}
 
 # Words that mark a phrase as a message OUTCOME/STATUS/RESULT rather than a
 # participant name (e.g. 'Login Successful', 'Payment Failed', 'Order
@@ -1246,8 +1250,23 @@ def _seq_extract_scenario_participants_fallback(scenario: str) -> List[str]:
 
     for m in re.finditer(r"\b([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\b", scenario):
         phrase = m.group(1).strip()
-        if phrase.split()[0].lower() in _SEQ_GENERIC_LEADIN_WORDS:
-            continue
+        words = phrase.split()
+        # A sentence-initial 'The ATM System' is captured as ONE run of
+        # capitalized words (since 'The' is also capitalized there) — drop
+        # only the leading generic word(s) and keep the real name ('ATM
+        # System'), instead of discarding the whole match. Discarding it
+        # entirely meant a name that ONLY ever appears sentence-initially
+        # in the scenario was never recognized as a multi-word candidate at
+        # all — leaving just the lone word ('system') with no multi-word
+        # candidate left for the dedup step below to drop it in favour of,
+        # so the generic word wrongly survived as the suggested name.
+        while words and words[0].lower() in _SEQ_GENERIC_LEADIN_WORDS:
+            words.pop(0)
+        if len(words) < 2:
+            continue  # nothing (or just one bare word) left — the single-
+                       # capitalized-word / role-noun passes below already
+                       # cover that case.
+        phrase = " ".join(words)
         if _is_outcome_phrase(phrase):
             continue
         candidates.add(phrase)
