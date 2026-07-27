@@ -1154,6 +1154,20 @@ _SEQ_STOPWORDS = {
 }
 _SEQ_COMPOUND_CONNECTORS = {"and", "&", "or", "then"}
 
+# Sequence-only, human-actor-specific subset of the shared _COMMON_ROLE_NOUNS
+# set. _COMMON_ROLE_NOUNS mixes genuinely human roles (customer, user,
+# doctor, ...) with words that are clearly system/object-like even though
+# they're still "roles" in a broader sense (system, bank, warehouse,
+# payment gateway, third party, external system). For matching an unnamed
+# shape to a scenario-derived name, an unnamed ACTOR should only be paired
+# with a human-role word, while an unnamed OBJECT/LIFELINE should be able to
+# match ANY of the non-human-actor candidates (including 'system', 'bank',
+# etc.), since those describe systems, not people.
+_SEQ_HUMAN_ACTOR_WORDS = _COMMON_ROLE_NOUNS - {
+    "system", "bank", "warehouse", "payment gateway", "third party",
+    "external system",
+}
+
 
 _SEQ_GENERIC_LEADIN_WORDS = {"a", "an", "the", "this", "that", "draw", "create", "design"}
 
@@ -2092,7 +2106,7 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
     # called. Only pairs when a like-for-like candidate is available —
     # never guesses a candidate of the wrong kind onto a shape.
     missing_lifeline_idxs = [i for i, e in enumerate(errors) if e["error_type"] == "MISSING_LIFELINE"]
-    role_candidate_idxs = [i for i in missing_lifeline_idxs if _n(errors[i]["element"]) in _COMMON_ROLE_NOUNS]
+    role_candidate_idxs = [i for i in missing_lifeline_idxs if _n(errors[i]["element"]) in _SEQ_HUMAN_ACTOR_WORDS]
     system_candidate_idxs = [i for i in missing_lifeline_idxs if i not in role_candidate_idxs]
     consumed_idxs = set()
 
@@ -2103,6 +2117,8 @@ def _rule_check_sequence(shapes: List[Dict], scenario: str = "",
             continue
         consumed_idxs.add(pick)
         cand_name = errors[pick]["element"]
+        if cand_name.islower():
+            cand_name = cand_name.capitalize()
         # State the missing name directly in 'element' (not just buried in
         # the description), and only NOW mark this fixable — we have an
         # actual scenario-derived name to write, not a generic placeholder.
